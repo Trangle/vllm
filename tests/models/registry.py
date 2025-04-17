@@ -275,6 +275,9 @@ _CROSS_ENCODER_EXAMPLE_MODELS = {
     "BertForSequenceClassification": _HfExamplesInfo("cross-encoder/ms-marco-MiniLM-L-6-v2"),  # noqa: E501
     "RobertaForSequenceClassification": _HfExamplesInfo("cross-encoder/quora-roberta-base"),  # noqa: E501
     "XLMRobertaForSequenceClassification": _HfExamplesInfo("BAAI/bge-reranker-v2-m3"),  # noqa: E501
+    "ModernBertForSequenceClassification":
+        _HfExamplesInfo("Alibaba-NLP/gte-reranker-modernbert-base",
+                        min_transformers_version="4.49"),
 }
 
 _MULTIMODAL_EXAMPLE_MODELS = {
@@ -363,7 +366,7 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     # Florence-2 uses BartFastTokenizer which can't be loaded from AutoTokenizer
     # Therefore, we borrow the BartTokenizer from the original Bart model
     "Florence2ForConditionalGeneration": _HfExamplesInfo("microsoft/Florence-2-base",  # noqa: E501
-                                                         tokenizer="facebook/bart-base",
+                                                         tokenizer="Isotr0py/Florence-2-tokenizer",
                                                          trust_remote_code=True),  # noqa: E501
     "MllamaForConditionalGeneration": _HfExamplesInfo("meta-llama/Llama-3.2-11B-Vision-Instruct"),  # noqa: E501
     "WhisperForConditionalGeneration": _HfExamplesInfo("openai/whisper-large-v3"),  # noqa: E501
