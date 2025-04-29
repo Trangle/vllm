@@ -298,9 +298,11 @@ _MULTIMODAL_EXAMPLE_MODELS = {
                                                 extras={"fork": "Isotr0py/deepseek-vl2-tiny"},  # noqa: E501
                                                 max_transformers_version="4.48",  # noqa: E501
                                                 transformers_version_reason="HF model is not compatible.",  # noqa: E501
-                                               hf_overrides={"architectures": ["DeepseekVLV2ForCausalLM"]}),  # noqa: E501
+                                                hf_overrides={"architectures": ["DeepseekVLV2ForCausalLM"]}),  # noqa: E501
     "FuyuForCausalLM": _HfExamplesInfo("adept/fuyu-8b"),
     "Gemma3ForConditionalGeneration": _HfExamplesInfo("google/gemma-3-4b-it"),
+    "GraniteSpeechForConditionalGeneration": _HfExamplesInfo("ibm-granite/granite-speech-3.3-8b",  # noqa: E501
+                                                             min_transformers_version="4.52.0"),  # noqa: E501
     "GLM4VForCausalLM": _HfExamplesInfo("THUDM/glm-4v-9b",
                                         trust_remote_code=True,
                                         hf_overrides={"architectures": ["GLM4VForCausalLM"]}),  # noqa: E501
@@ -335,6 +337,8 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "MiniCPMV": _HfExamplesInfo("openbmb/MiniCPM-Llama3-V-2_5",
                                 extras={"2.6": "openbmb/MiniCPM-V-2_6"},  # noqa: E501
                                 trust_remote_code=True),
+    "MiniMaxVL01ForConditionalGeneration": _HfExamplesInfo("MiniMaxAI/MiniMax-VL-01", # noqa: E501
+                                              trust_remote_code=True),
     "Mistral3ForConditionalGeneration": _HfExamplesInfo("mistralai/Mistral-Small-3.1-24B-Instruct-2503",  # noqa: E501
                                                         extras={"fp8": "nm-testing/Mistral-Small-3.1-24B-Instruct-2503-FP8-dynamic"}),  # noqa: E501
     "MolmoForCausalLM": _HfExamplesInfo("allenai/Molmo-7B-D-0924",
