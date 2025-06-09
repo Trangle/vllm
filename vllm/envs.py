@@ -122,6 +122,8 @@ if TYPE_CHECKING:
     VLLM_ALL2ALL_BACKEND: str = "naive"
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
+    VLLM_SLEEP_WHEN_IDLE: bool = False
+    VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
 
 
 def get_default_cache_root():
@@ -841,6 +843,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Regex timeout for use by the vLLM tool parsing plugins.
     "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS":
     lambda: int(os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")),
+
+    # Reduce CPU usage when vLLM is idle. Enabling this will incur small
+    # latency penalty when a request eventually comes.
+    "VLLM_SLEEP_WHEN_IDLE":
+    lambda: bool(int(os.getenv("VLLM_SLEEP_WHEN_IDLE", "0"))),
+
+    # Control the max chunk bytes (in MB) for the rpc message queue.
+    # Object larger than this threshold will be broadcast to worker
+    # processes via zmq.
+    "VLLM_MQ_MAX_CHUNK_BYTES_MB":
+    lambda: int(os.getenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", "16")),
 }
 
 # --8<-- [end:env-vars-definition]
