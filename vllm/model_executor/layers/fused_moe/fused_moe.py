@@ -25,6 +25,8 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size)
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoEP)
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceDelegate)
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache, moe_kernel_quantize_input)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
@@ -1190,8 +1192,9 @@ def fused_experts(
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
     elif (allow_cutlass_block_scaled_grouped_gemm and use_fp8_w8a8
-          and _valid_cutlass_block_scaled_grouped_gemm(w1, w2)):
-        assert apply_router_weight_on_input is False
+          and _valid_cutlass_block_scaled_grouped_gemm(
+              w1, w2, inplace, activation, apply_router_weight_on_input,
+              expert_map)):
         return run_cutlass_block_scaled_fused_experts(
             a=hidden_states,
             w1=w1,
@@ -1595,6 +1598,10 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
     def supports_expert_map(self) -> bool:
         return True
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        # Let PrepareAndFinalize::finalize() decide the impl.
+        return TopKWeightAndReduceDelegate()
 
     def workspace_shapes(
         self,
