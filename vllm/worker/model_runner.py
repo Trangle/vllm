@@ -22,6 +22,7 @@ import vllm.envs as envs
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.attention.backends.abstract import AttentionState
 from vllm.attention.backends.utils import CommonAttentionState
+from vllm.compilation.counter import compilation_counter
 from vllm.config import CompilationLevel, VllmConfig
 from vllm.core.scheduler import SchedulerOutputs
 from vllm.distributed import broadcast_tensor_dict, get_pp_group
@@ -507,8 +508,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         if inter_data.is_prompt:
             context_len = seq_data.get_num_computed_tokens()
             seq_len = min(seq_len, context_len + token_chunk_size)
-        elif self.runner.scheduler_config.is_multi_step or \
-            self.runner.model_config.is_encoder_decoder:
+        elif self.runner.model_config.is_encoder_decoder:
             context_len = seq_len - 1
         else:
             context_len = seq_data.get_num_computed_tokens()
@@ -762,8 +762,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         has Prefills (if any). The rest of the steps are guaranteed to be all
         decodes. In this case, we set up the padding as if all the sequences
         are decodes so we may run all steps except the first step in CUDA graph
-        mode. The padding is accounted for in the multi-step `advance_step`
-        family of functions.
+        mode.
 
         Args:
             num_seqs (int): Number of sequences scheduled to run.
@@ -777,9 +776,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             int: Returns the determined number of padding sequences. If
                 CUDA graphs is not viable, returns -1.
         """
-        is_mscp: bool = self.runner.scheduler_config.is_multi_step and \
-                    self.runner.scheduler_config.chunked_prefill_enabled
-        decode_only = self.decode_only or is_mscp
+        decode_only = self.decode_only
         if not decode_only:
             # Early exit so we can treat num_seqs as the batch_size below.
             return -1
@@ -1121,6 +1118,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             CompilationLevel.DYNAMO_AS_IS and supports_dynamo():
             backend = self.vllm_config.compilation_config.init_backend(
                 self.vllm_config)
+            compilation_counter.dynamo_as_is_count += 1
             self.model = torch.compile(
                 self.model,
                 fullgraph=envs.VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE,
@@ -1785,24 +1783,32 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         if model_input.inputs_embeds is not None:
             if self.is_driver_worker:
-                sampled = broadcast_tensor_dict(
-                    {"token_ids": output.sampled_token_ids})
+                sampled_token_ids = []
+                valid_outputs = []
+                for sequence_group_output in output.outputs:
+                    if len(sequence_group_output.samples) == 0:
+                        continue
+                    assert len(sequence_group_output.samples) == 1
+                    valid_outputs.append(sequence_group_output)
+                    sampled_token_ids.append(
+                        sequence_group_output.samples[0].output_token)
+                sampled_token_ids = torch.tensor(sampled_token_ids).to(
+                    self.device)
+                sampled_token_ids = broadcast_tensor_dict(
+                    {"sampled_token_ids":
+                     sampled_token_ids})["sampled_token_ids"]
             else:
-                sampled = broadcast_tensor_dict()
-            if sampled["token_ids"] is not None:
-                sampled_token_embeds = self.model.get_input_embeddings(
-                    sampled["token_ids"].squeeze(1))
+                sampled_token_ids = broadcast_tensor_dict(
+                )["sampled_token_ids"]
+            if len(sampled_token_ids) > 0:
+                sampled_token_embeds = \
+                    self.model.get_input_embeddings(sampled_token_ids)
                 if self.is_driver_worker:
                     self.sampler.include_gpu_probs_tensor = \
                         orig_include_gpu_probs
-
-                    output.sampled_token_embeds = sampled_token_embeds
-
-                    for token_embed, sequence_group_output in zip(
-                            output.sampled_token_embeds, output.outputs):
-                        assert len(sequence_group_output.samples) == 1
-                        sequence_group_output.samples[
-                            0].output_embed = token_embed
+                    for i, sequence_group_output in enumerate(valid_outputs):
+                        sequence_group_output.samples[0].output_embed = \
+                            sampled_token_embeds[i]
 
         if not self.is_driver_worker:
             return []
