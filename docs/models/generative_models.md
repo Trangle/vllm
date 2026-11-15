@@ -2,9 +2,9 @@
 
 vLLM provides first-class support for generative models, which covers most of LLMs.
 
-In vLLM, generative models implement the[VllmModelForTextGeneration][vllm.model_executor.models.VllmModelForTextGeneration] interface.
+In vLLM, generative models implement the [VllmModelForTextGeneration][vllm.model_executor.models.VllmModelForTextGeneration] interface.
 Based on the final hidden states of the input, these models output log probabilities of the tokens to generate,
-which are then passed through [Sampler][vllm.v1.sample.sampler.Sampler] to obtain the final text.
+which are then passed through [Sampler][vllm.v1.worker.gpu.sample.sampler.Sampler] to obtain the final text.
 
 ## Configuration
 
@@ -59,11 +59,12 @@ for output in outputs:
     By default, vLLM will use sampling parameters recommended by model creator by applying the `generation_config.json` from the huggingface model repository if it exists. In most cases, this will provide you with the best results by default if [SamplingParams][vllm.SamplingParams] is not specified.
 
     However, if vLLM's default sampling parameters are preferred, please pass `generation_config="vllm"` when creating the [LLM][vllm.LLM] instance.
-A code example can be found here: <gh-file:examples/offline_inference/basic/basic.py>
+A code example can be found here: [examples/basic/offline_inference/basic.py](../../examples/basic/offline_inference/basic.py)
 
 ### `LLM.beam_search`
 
 The [beam_search][vllm.LLM.beam_search] method implements [beam search](https://huggingface.co/docs/transformers/en/generation_strategies#beam-search) on top of [generate][vllm.LLM.generate].
+Each prompt's search stops when it reaches `max_tokens` generated tokens or the model's context length limit (prompt plus generated tokens). Reaching the context limit returns the completed beams without stopping other prompts in the batch.
 For example, to search using 5 beams and output at most 50 tokens:
 
 ```python
@@ -98,15 +99,15 @@ and automatically applies the model's [chat template](https://huggingface.co/doc
     conversation = [
         {
             "role": "system",
-            "content": "You are a helpful assistant"
+            "content": "You are a helpful assistant",
         },
         {
             "role": "user",
-            "content": "Hello"
+            "content": "Hello",
         },
         {
             "role": "assistant",
-            "content": "Hello! How can I assist you today?"
+            "content": "Hello! How can I assist you today?",
         },
         {
             "role": "user",
@@ -121,13 +122,13 @@ and automatically applies the model's [chat template](https://huggingface.co/doc
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
     ```
 
-A code example can be found here: <gh-file:examples/offline_inference/basic/chat.py>
+A code example can be found here: [examples/basic/offline_inference/chat.py](../../examples/basic/offline_inference/chat.py)
 
 If the model doesn't have a chat template or you want to specify another one,
 you can explicitly pass a chat template:
 
 ```python
-from vllm.entrypoints.chat_utils import load_chat_template
+from vllm.renderers.chat_utils import load_chat_template
 
 # You can find a list of existing chat templates under `examples/`
 custom_template = load_chat_template(chat_template="<path_to_template>")
@@ -138,7 +139,7 @@ outputs = llm.chat(conversation, chat_template=custom_template)
 
 ## Online Serving
 
-Our [OpenAI-Compatible Server](../serving/openai_compatible_server.md) provides endpoints that correspond to the offline APIs:
+Our [OpenAI-Compatible Server](../serving/online_serving/openai_compatible_server.md) provides endpoints that correspond to the offline APIs:
 
-- [Completions API][completions-api] is similar to `LLM.generate` but only accepts text.
-- [Chat API][chat-api]  is similar to `LLM.chat`, accepting both text and [multi-modal inputs](../features/multimodal_inputs.md) for models with a chat template.
+- [Completions API](../serving/online_serving/openai_compatible_server.md#completions-api) is similar to `LLM.generate` but only accepts text.
+- [Chat API](../serving/online_serving/openai_compatible_server.md#chat-api)  is similar to `LLM.chat`, accepting both text and [multi-modal inputs](../features/multimodal_inputs.md) for models with a chat template.

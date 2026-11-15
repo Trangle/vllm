@@ -1,6 +1,6 @@
-# NVIDIA TensorRT Model Optimizer
+# NVIDIA Model Optimizer
 
-The [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) is a library designed to optimize models for inference with NVIDIA GPUs. It includes tools for Post-Training Quantization (PTQ) and Quantization Aware Training (QAT) of Large Language Models (LLMs), Vision Language Models (VLMs), and diffusion models.
+The [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) is a library designed to optimize models for inference with NVIDIA GPUs. It includes tools for Post-Training Quantization (PTQ) and Quantization Aware Training (QAT) of Large Language Models (LLMs), Vision Language Models (VLMs), and diffusion models.
 
 We recommend installing the library with:
 
@@ -8,9 +8,83 @@ We recommend installing the library with:
 pip install nvidia-modelopt
 ```
 
+## Supported ModelOpt checkpoint formats
+
+vLLM detects ModelOpt checkpoints via `hf_quant_config.json` and supports the
+following `quantization.quant_algo` values:
+
+- `FP8`: per-tensor weight scale (+ optional static activation scale).
+- `FP8_PER_CHANNEL_PER_TOKEN`: per-channel weight scale and dynamic per-token activation quantization.
+- `FP8_PB_WO` (ModelOpt may emit `fp8_pb_wo`): block-scaled FP8 weight-only (typically 128×128 blocks).
+- `NVFP4`: ModelOpt NVFP4 checkpoints (use `quantization="modelopt_fp4"`).
+- `W4A16_NVFP4`: weight-only ModelOpt NVFP4 checkpoints with 16-bit
+  activations (use `quantization="modelopt_fp4"`).
+- `MXFP8`: ModelOpt MXFP8 checkpoints (use `quantization="modelopt_mxfp8"`).
+- `INT8_PB_WO`: block-scaled INT8 weight-only linear layers with 16-bit
+  activations (use `quantization="modelopt_int8"`): a symmetric int8 `weight`
+  and a `weight_scale` per `group_size` input elements (for example 16 or 32).
+  `group_size` is required. vLLM serves these layers with its mixed-precision
+  (WNA16) kernels, such as Marlin and Humming. MoE experts are not supported.
+- `MIXED_PRECISION`: per-layer formats specified by `quantized_layers`
+  (use `quantization="modelopt_mixed"`). Each layer may use any format above;
+  `INT8_PB_WO` layers take their own `group_size`. A token embedding marked
+  `W4A16_NVFP4` stays packed and only the looked-up rows are dequantized; the
+  model must build its embedding with the checkpoint prefix, as Nemotron-H does.
+  Such an embedding cannot be tied to the LM head, so checkpoints that tie it
+  are rejected.
+
+For per-tensor `FP8`, vLLM converts E4M3FN weights and scales to E4M3FNUZ
+when required by the GPU, for example on AMD MI300.
+
+For Qwen3-based DFlash and DSpark drafts, `quantized_layers` and exclusion lists
+use the exported checkpoint's module names. vLLM maps these names to the draft's
+module prefix and decoder layer indices before constructing quantized layers.
+
+!!! note
+    For NVFP4 checkpoints, vLLM selects a GEMM kernel automatically at load
+    time from the backends available on the current platform (CUTLASS,
+    FlashInfer, Marlin, and others). On GPUs without a supported native FP4
+    GEMM kernel, vLLM falls back to weight-only (W4A16) execution via Marlin
+    and logs a warning; this may reduce throughput for compute-heavy
+    workloads. Use `--linear-backend` to override the automatic selection
+    (this replaces the deprecated `VLLM_NVFP4_GEMM_BACKEND` environment
+    variable). Values relevant to NVFP4 include `cutlass`,
+    `flashinfer_cutlass`, `flashinfer_cutedsl`, `flashinfer_trtllm`,
+    `flashinfer_cudnn`, and `marlin`; see `KernelConfig` on the
+    [Engine Arguments](../../configuration/engine_args.md) page and shown by
+    `vllm serve --help=KernelConfig`.
+
+!!! note
+    For models quantized to MXFP8 with BF16 activations on SM100-family GPUs,
+    use `--linear-backend flashinfer_trtllm` to select FlashInfer's TensorRT-LLM
+    GEMM backend.
+
+For Muse Spark NVFP4 on NVIDIA, the prepared-input FlashInfer TRT-LLM path
+skips CUDA-graph padding rows when routing runs outside the expert kernel.
+The router writes expert IDs of `-1` and zero weights in its existing fused
+kernel. This requires a padding mask matching the routed token layout;
+other dispatch paths retain their backend-specific behavior.
+Set `VLLM_MOE_SKIP_PADDING=0` before starting the engine to disable this
+optimization for comparisons.
+
+## Benchmarking with dummy weights
+
+For performance experiments with random weights, use `--load-format dummy`.
+FP8 weights get random codes across the FP8 range, as checkpoints use it, so
+compute-bound steps draw realistic power (a narrow range runs faster than real
+weights on power-capped GPUs).
+ModelOpt NVFP4 MoE layers initialize positive quantization scales with matching
+gate/up global scales, including for FlashInfer MegaMoE
+(`--moe-backend flashinfer_moe_ep_cutedsl`).
+Muse Spark's NVIDIA `deep_gemm_mega_moe` backend also supports dummy loading:
+it initializes valid NVFP4 scales and finalizes its expert weights and residual
+constants before the first forward. Enable expert parallelism for this backend.
+Dummy weights are for benchmarking, not model quality evaluation. Normal
+checkpoint loading uses the checkpoint's scales.
+
 ## Quantizing HuggingFace Models with PTQ
 
-You can quantize HuggingFace models using the example scripts provided in the TensorRT Model Optimizer repository. The primary script for LLM PTQ is typically found within the `examples/llm_ptq` directory.
+You can quantize HuggingFace models using the example scripts provided in the Model Optimizer repository. The primary script for LLM PTQ is typically found within the `examples/llm_ptq` directory.
 
 Below is an example showing how to quantize a model using modelopt's PTQ API:
 
@@ -56,9 +130,9 @@ The quantized checkpoint can then be deployed with vLLM. As an example, the foll
     from vllm import LLM, SamplingParams
 
     def main():
-
         model_id = "nvidia/Llama-3.1-8B-Instruct-FP8"
-        # Ensure you specify quantization='modelopt' when loading the modelopt checkpoint
+
+        # Ensure you specify quantization="modelopt" when loading the modelopt checkpoint
         llm = LLM(model=model_id, quantization="modelopt", trust_remote_code=True)
 
         sampling_params = SamplingParams(temperature=0.8, top_p=0.9)
@@ -80,3 +154,24 @@ The quantized checkpoint can then be deployed with vLLM. As an example, the foll
     if __name__ == "__main__":
         main()
     ```
+
+## Running the OpenAI-compatible server
+
+To serve a local ModelOpt checkpoint via the OpenAI-compatible API:
+
+```bash
+vllm serve <path_to_exported_checkpoint> \
+  --quantization modelopt \
+  --host 0.0.0.0 --port 8000
+```
+
+## Testing (local checkpoints)
+
+vLLM's ModelOpt unit tests are gated by local checkpoint paths and are skipped
+by default in CI. To run the tests locally:
+
+```bash
+export VLLM_TEST_MODELOPT_FP8_PC_PT_MODEL_PATH=<path_to_fp8_pc_pt_checkpoint>
+export VLLM_TEST_MODELOPT_FP8_PB_WO_MODEL_PATH=<path_to_fp8_pb_wo_checkpoint>
+pytest -q tests/quantization/test_modelopt.py
+```

@@ -11,15 +11,17 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 from transformers.utils import torch_int
 
-from vllm.attention.layer import MultiHeadAttention
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention import MMEncoderAttention
+from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from .utils import AutoWeightsLoader
 
 NORM2FN = {
     "rms_norm": RMSNorm,
@@ -43,7 +45,7 @@ class InternS1VisionPatchEmbeddings(nn.Module):
         self.num_patches = num_patches
         self.patch_shape = patch_shape
 
-        self.projection = nn.Conv2d(
+        self.projection = Conv2dLayer(
             num_channels, hidden_size, kernel_size=patch_size, stride=patch_size
         )
 
@@ -63,7 +65,7 @@ class InternS1VisionPatchEmbeddings(nn.Module):
 
 
 class InternS1VisionEmbeddings(nn.Module):
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PreTrainedConfig):
         super().__init__()
         self.config = config
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
@@ -89,15 +91,13 @@ class InternS1VisionEmbeddings(nn.Module):
     def interpolate_pos_encoding(
         self, embeddings: torch.Tensor, height: int, width: int
     ) -> torch.Tensor:
-        """
-        This method allows to interpolate the pre-trained position encodings, to be able to use the model on higher resolution
+        """This method allows to interpolate the pre-trained position encodings, to be able to use the model on higher resolution
         images. This method is also adapted to support torch.jit tracing.
 
         Adapted from:
         - https://github.com/facebookresearch/dino/blob/de9ee3df6cf39fac952ab558447af1fa1365362a/vision_transformer.py#L174-L194, and
         - https://github.com/facebookresearch/dinov2/blob/e1277af2ba9496fbadf7aec6eba56e8d882d1e35/dinov2/models/vision_transformer.py#L179-L211
         """  # noqa: E501
-
         num_patches = embeddings.shape[1] - 1
         num_positions = self.position_embeddings.shape[1] - 1
 
@@ -162,13 +162,14 @@ class InternS1VisionEmbeddings(nn.Module):
 
 
 class InternSdpaAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed attention from 'Attention Is All You Need' paper."""
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         *,
         num_dummy_heads: int = 0,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -213,22 +214,25 @@ class InternSdpaAttention(nn.Module):
 
         self.projection_layer = nn.Linear(self.dummy_dim, self.embed_dim)
 
-        # Use unified MultiHeadAttention with automatic backend selection
-        self.attn = MultiHeadAttention(self.num_heads, self.head_dim, self.scale)
+        # Use unified MMEncoderAttention with automatic backend selection
+        self.attn = MMEncoderAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scale,
+            prefix=f"{prefix}.attn",
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, C = x.shape
-
+        """X shape: (B, N, C)."""
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
         if self.qk_normalization:
-            B_, N_, H_, D_ = q.shape
-            q = self.q_norm(q.flatten(-2, -1)).view(B_, N_, H_, D_)
-            k = self.k_norm(k.flatten(-2, -1)).view(B_, N_, H_, D_)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
-        # Use unified MultiHeadAttention with automatic backend selection
+        # Use unified MMEncoderAttention with automatic backend selection
         x = self.attn(q, k, v)
 
         x = self.projection_layer(x)
@@ -238,7 +242,7 @@ class InternSdpaAttention(nn.Module):
 class InternS1VisionMLP(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -272,7 +276,7 @@ class InternS1VisionMLP(nn.Module):
 class InternS1VisionLayer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         quant_config: QuantizationConfig | None = None,
         *,
         num_dummy_heads: int = 0,
@@ -307,13 +311,17 @@ class InternS1VisionLayer(nn.Module):
 
     def _init_attn(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         quant_config: QuantizationConfig | None,
         *,
         num_dummy_heads: int,
         prefix: str = "",
     ):
-        return InternSdpaAttention(config, num_dummy_heads=num_dummy_heads)
+        return InternSdpaAttention(
+            config,
+            num_dummy_heads=num_dummy_heads,
+            prefix=prefix,
+        )
 
     def forward(
         self,
@@ -335,7 +343,7 @@ class InternS1VisionLayer(nn.Module):
 class InternS1VisionEncoder(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         quant_config: QuantizationConfig | None = None,
         *,
         num_hidden_layers_override: int | None = None,
@@ -374,7 +382,7 @@ class InternS1VisionEncoder(nn.Module):
 class InternS1VisionModel(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         quant_config: QuantizationConfig | None = None,
         *,
         num_hidden_layers_override: int | None = None,
@@ -423,11 +431,5 @@ class InternS1VisionModel(nn.Module):
         return encoder_outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)

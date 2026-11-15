@@ -9,18 +9,19 @@ import torch
 import torch.nn as nn
 from transformers import Blip2VisionConfig, BlipVisionConfig
 
-from vllm.attention.layer import MultiHeadAttention
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention import MMEncoderAttention
+from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .interfaces import SupportsQuant
+from .utils import AutoWeightsLoader, WeightsMapper
 
 
 def get_blip_patch_grid_length(*, image_size: int, patch_size: int) -> int:
@@ -35,7 +36,7 @@ def get_blip_num_patches(*, image_size: int, patch_size: int) -> int:
     return grid_length * grid_length
 
 
-# Adapted from https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/models/blip/modeling_blip.py#L164 # noqa
+# Adapted from https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/models/blip/modeling_blip.py#L164
 class BlipVisionEmbeddings(nn.Module):
     def __init__(self, config: BlipVisionConfig | Blip2VisionConfig):
         super().__init__()
@@ -47,7 +48,7 @@ class BlipVisionEmbeddings(nn.Module):
 
         self.class_embedding = nn.Parameter(torch.randn(1, 1, self.embed_dim))
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=3,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -81,7 +82,7 @@ class BlipVisionEmbeddings(nn.Module):
 
 
 class BlipAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed attention from 'Attention Is All You Need' paper."""
 
     def __init__(
         self,
@@ -121,23 +122,18 @@ class BlipAttention(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
 
-        self.attn = MultiHeadAttention(
-            self.num_heads_per_partition, self.head_dim, self.scale
-        )
-
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return (
-            tensor.view(bsz, seq_len, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-            .contiguous()
+        self.attn = MMEncoderAttention(
+            self.num_heads_per_partition,
+            self.head_dim,
+            self.scale,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
     ):
-        """Input shape: Batch x Time x Channel"""
-
+        """Input shape: Batch x Time x Channel."""
         qkv_states, _ = self.qkv(hidden_states)
         query_states, key_states, value_states = qkv_states.chunk(3, dim=-1)
         out = self.attn(query_states, key_states, value_states)
@@ -216,12 +212,12 @@ class BlipEncoderLayer(nn.Module):
 
 
 class BlipEncoder(nn.Module):
-    """
-    Transformer encoder consisting of `config.num_hidden_layers` self
+    """Transformer encoder consisting of `config.num_hidden_layers` self
     attention layers. Each layer is a [`BlipEncoderLayer`].
 
     Args:
         config: BlipConfig
+
     """
 
     def __init__(
@@ -264,6 +260,14 @@ class BlipVisionModel(nn.Module, SupportsQuant):
     main_input_name = "pixel_values"
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            ".q_proj": (".qkv", "q"),
+            ".k_proj": (".qkv", "k"),
+            ".v_proj": (".qkv", "v"),
+        }
+    )
+
     def __init__(
         self,
         config: BlipVisionConfig,
@@ -301,6 +305,9 @@ class BlipVisionModel(nn.Module, SupportsQuant):
             )
         else:
             self.post_layernorm = None
+            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
+                orig_to_new_prefix={"post_layernorm.": None}
+            )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embeddings(pixel_values)
@@ -312,38 +319,15 @@ class BlipVisionModel(nn.Module, SupportsQuant):
         return self.post_layernorm(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        layer_count = len(self.encoder.layers)
+        loader = AutoWeightsLoader(self)
 
-        for name, loaded_weight in weights:
-            # post_layernorm is not needed in BlipVisionModel
-            if name.startswith("post_layernorm") and self.post_layernorm is None:
-                continue
-
-            # omit layers when num_hidden_layers_override is set
-            if name.startswith("encoder.layers"):
-                layer_idx = int(name.split(".")[2])
-                if layer_idx >= layer_count:
+        # omit layers when num_hidden_layers_override is set
+        def _filter(ws):
+            for name, weight in ws:
+                if name.startswith("encoder.layers.") and int(
+                    name.split(".")[2]
+                ) >= len(self.encoder.layers):
                     continue
+                yield name, weight
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        return loader.load_weights(_filter(weights), mapper=self.hf_to_vllm_mapper)

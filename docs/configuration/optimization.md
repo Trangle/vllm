@@ -5,9 +5,66 @@ This guide covers optimization strategies and performance tuning for vLLM V1.
 !!! tip
     Running out of memory? Consult [this guide](./conserving_memory.md) on how to conserve memory.
 
+## Optimization Levels
+
+vLLM provides 4 optimization levels (`-O0`, `-O1`, `-O2`, `-O3`) that allow users to trade off startup time for performance:
+
+- `-O0`: No optimizations. Fastest startup time, but lowest performance.
+- `-O1`: Fast optimization. Simple compilation and fast fusions, and PIECEWISE cudagraphs.
+- `-O2`: Default optimization. Additional compilation ranges, additional fusions, FULL_AND_PIECEWISE cudagraphs.
+- `-O3`: Aggressive optimization. Currently equal to `-O2`, but may include additional time-consuming or experimental optimizations in the future.
+
+For more information, see the [optimization level documentation](../design/optimization_levels.md).
+
+## Faster Startup
+
+Beyond the optimization levels, three mechanisms reduce time-to-first-token on repeated boots of the same (model, config, hardware) combination:
+
+- **Reuse the compile cache.** vLLM persists `torch.compile` artifacts under `VLLM_CACHE_ROOT` (default `~/.cache/vllm`), and the cache directory can be copied between machines or baked into a container image; see the [torch.compile design doc](../design/torch_compile.md). Set `VLLM_FORCE_AOT_LOAD=1` to fail loudly instead of silently recompiling when the cache misses (any change to the model, config, relevant `VLLM_*` environment variables, torch build, or GPU model invalidates it).
+- **Skip memory profiling with `--kv-cache-memory`.** On startup, vLLM logs the exact `--kv-cache-memory` value that reproduces the current allocation. Passing it back on the next boot skips the memory-profiling measurement and the CUDA-graph memory estimation pass. Note that this has performance implications: the KV cache is sized to exactly the given value instead of being measured, so a conservative value caps batch concurrency (and therefore throughput), while an optimistic one fails at allocation time. The value is only valid on the same GPU with the same initial free memory; if a boot OOMs after hardware or co-tenant changes, remove the flag to re-profile. On CUDA and ROCm, the flag also turns off the extensible KV cache (see [GPU Memory Utilization](#gpu-memory-utilization)), whose measured sizing already skips the CUDA-graph memory estimation pass.
+- **Serve without CUDA graphs using `--enforce-eager`.** Skips both compilation and CUDA-graph capture for the fastest possible startup, at the cost of steady-state decode performance. Useful for development loops and for measuring how much of a boot is compile/capture.
+
+## GPU Memory Utilization
+
+On CUDA and ROCm, vLLM sizes the KV cache from the memory actually free after
+CUDA graph capture and warmup (the extensible KV cache, `--enable-extensible-kv-cache`).
+It keeps the transient memory it measured free, plus a safety margin, so
+`gpu_memory_utilization` defaults to 1.0 there and doesn't need tuning to avoid
+out-of-memory errors. Leave it unset unless you need to leave headroom: an explicit
+value is a hard cap on everything the instance uses, and anything below 1.0 takes
+memory away from the KV cache. vLLM warns at startup when a value above 0.7 keeps
+free memory out of the KV cache.
+
+Set it below 1.0 only to leave memory for something vLLM doesn't measure:
+
+- **Other processes on the same GPU**, such as another vLLM instance, a colocated
+  training process, or an encoder instance, especially ones that allocate memory after
+  vLLM has started. vLLM measures free memory once, after warmup, so it can't see
+  later allocations.
+- **Unified-memory devices**, such as DGX Spark (GB10) or Jetson, where the CPU and
+  the operating system share the same memory.
+- **Weight updates**, for example in reinforcement learning. Weight transfer engines
+  create their communicators and receive buffers (such as the NCCL backend's packed
+  buffers or [sharded RDT](../training/weight_transfer/sharded_rdt.md)'s receive
+  buffers) after the KV cache is sized, and vLLM doesn't reserve memory for them.
+  During a pause that cleared the KV cache, a layer-by-layer update that is short of
+  memory for the weights borrows the cache's memory, but that check doesn't count
+  these buffers.
+- **KV connectors that allocate their own device buffers**, which they do after the
+  KV cache is sized (for example the HF3FS connector's copy buffers).
+
+On other platforms (TPU, XPU, CPU and others), and where vLLM falls back to
+estimate-based sizing, `gpu_memory_utilization` still sets the fraction of device memory
+vLLM uses for weights, activations and the KV cache: it defaults to 0.92, and a higher
+value gives a larger KV cache. vLLM falls back, for example, with
+`--no-enable-extensible-kv-cache`, `--kv-cache-memory` or `--num-gpu-blocks-override`,
+with KV connectors that share or register the KV cache in ways it doesn't support
+(LMCache's multi-process connector; NIXL, Mooncake or MoRIIO on ROCm), and with NIXL
+within a host that has no IMEX channel.
+
 ## Preemption
 
-Due to the auto-regressive nature of transformer architecture, there are times when KV cache space is insufficient to handle all batched requests.
+Due to the autoregressive nature of transformer architecture, there are times when KV cache space is insufficient to handle all batched requests.
 In such cases, vLLM can preempt requests to free up KV cache space for other requests. Preempted requests are recomputed when sufficient KV cache space becomes
 available again. When this occurs, you may see the following warning:
 
@@ -18,7 +75,7 @@ WARNING 05-09 00:49:33 scheduler.py:1057 Sequence group 0 is preempted by Preemp
 While this mechanism ensures system robustness, preemption and recomputation can adversely affect end-to-end latency.
 If you frequently encounter preemptions, consider the following actions:
 
-- Increase `gpu_memory_utilization`. vLLM pre-allocates GPU cache using this percentage of memory. By increasing utilization, you can provide more KV cache space.
+- Leave `gpu_memory_utilization` unset, or increase it. With the extensible KV cache (the default on CUDA and ROCm) it defaults to 1.0, and a lower value takes memory away from the KV cache; elsewhere it defaults to 0.92 and sets the fraction of device memory vLLM uses. See [GPU Memory Utilization](#gpu-memory-utilization).
 - Decrease `max_num_seqs` or `max_num_batched_tokens`. This reduces the number of concurrent requests in a batch, thereby requiring less KV cache space.
 - Increase `tensor_parallel_size`. This shards model weights across GPUs, allowing each GPU to have more memory available for KV cache. However, increasing this value may cause excessive synchronization overhead.
 - Increase `pipeline_parallel_size`. This distributes model layers across GPUs, reducing the memory needed for model weights on each GPU, indirectly leaving more memory available for KV cache. However, increasing this value may cause latency penalties.
@@ -27,29 +84,29 @@ You can monitor the number of preemption requests through Prometheus metrics exp
 
 In vLLM V1, the default preemption mode is `RECOMPUTE` rather than `SWAP`, as recomputation has lower overhead in the V1 architecture.
 
-[](){ #chunked-prefill }
-
 ## Chunked Prefill
 
 Chunked prefill allows vLLM to process large prefills in smaller chunks and batch them together with decode requests. This feature helps improve both throughput and latency by better balancing compute-bound (prefill) and memory-bound (decode) operations.
 
-In vLLM V1, **chunked prefill is always enabled by default**. This is different from vLLM V0, where it was conditionally enabled based on model characteristics.
-
-With chunked prefill enabled, the scheduling policy prioritizes decode requests. It batches all pending decode requests before scheduling any prefill operations. When there are available tokens in the `max_num_batched_tokens` budget, it schedules pending prefills. If a pending prefill request cannot fit into `max_num_batched_tokens`, it automatically chunks it.
+In V1, **chunked prefill is enabled by default whenever possible**. With chunked prefill enabled, the scheduling policy prioritizes decode requests. It batches all pending decode requests before scheduling any prefill operations. When there are available tokens in the `max_num_batched_tokens` budget, it schedules pending prefills. If a pending prefill request cannot fit into `max_num_batched_tokens`, it automatically chunks it.
 
 This policy has two benefits:
 
-- It improves ITL and generation decode because decode requests are prioritized.
+- It improves inter-token latency (ITL) and generation decode because decode requests are prioritized.
 - It helps achieve better GPU utilization by locating compute-bound (prefill) and memory-bound (decode) requests to the same batch.
 
 ### Performance Tuning with Chunked Prefill
 
 You can tune the performance by adjusting `max_num_batched_tokens`:
 
-- Smaller values (e.g., 2048) achieve better inter-token latency (ITL) because there are fewer prefills slowing down decodes.
+- Smaller values (e.g., 2048) achieve better ITL because there are fewer prefills slowing down decodes.
 - Higher values achieve better time to first token (TTFT) as you can process more prefill tokens in a batch.
 - For optimal throughput, we recommend setting `max_num_batched_tokens > 8192` especially for smaller models on large GPUs.
 - If `max_num_batched_tokens` is the same as `max_model_len`, that's almost the equivalent to the V0 default scheduling policy (except that it still prioritizes decodes).
+
+!!! warning
+    When chunked prefill is disabled, `max_num_batched_tokens` must be greater than `max_model_len`.  
+    In that case, if `max_num_batched_tokens < max_model_len`, vLLM may crash at server start‑up.
 
 ```python
 from vllm import LLM
@@ -98,7 +155,7 @@ from vllm import LLM
 
 # Combine pipeline and tensor parallelism
 llm = LLM(
-    model="meta-llama/Llama-3.3-70B-Instruct,
+    model="meta-llama/Llama-3.3-70B-Instruct",
     tensor_parallel_size=4,
     pipeline_parallel_size=2,
 )
@@ -128,6 +185,119 @@ Data parallelism replicates the entire model across multiple GPU sets and proces
 
 Data parallelism can be combined with the other parallelism strategies and is set by `data_parallel_size=N`.
 Note that MoE layers will be sharded according to the product of the tensor parallel size and data parallel size.
+
+### NUMA Binding for Multi-Socket GPU Nodes
+
+On multi-socket GPU servers, GPU worker processes can lose performance if their
+CPU execution and memory allocation drift away from the NUMA node nearest to the
+GPU. vLLM can pin each worker with `numactl` before the Python subprocess starts,
+so the interpreter, imports, and early allocator state are created with the
+desired NUMA policy from the beginning.
+
+By default, vLLM binds automatically when the environment supports it:
+CUDA-alike platform, multiple NUMA nodes, `numactl` installed, permission to
+set NUMA memory policy, unrestricted CPU affinity, a default NUMA memory policy,
+the `spawn` multiprocessing start method (the CLI default), and a local `mp` or
+`uni` executor with multiprocessing DP, including supported prefill context
+parallelism (PCP) launches. Ray, external launchers and `--device-ids` remapping
+are excluded from automatic binding.
+Otherwise vLLM starts unbound. Use
+`--numa-bind` to make a missing `numactl` or undetectable GPU-to-NUMA topology a
+startup error, or `--no-numa-bind` to disable binding. Passing
+`--numa-bind-nodes` or `--numa-bind-cpus` explicitly enables binding even without
+`--numa-bind`: either list requests strict `--membind`, not automatic soft memory
+preference or CPU-only binding. Neither can be combined with `--no-numa-bind`.
+Automatic binding preserves an existing non-default memory policy, such as
+interleave, preferred-node, or bind. Explicit enablement may override it.
+
+Automatic binding uses `--cpunodebind=<node> --preferred=<node>` for each worker:
+memory allocations prefer the GPU-local node but can fall back to other nodes.
+EngineCore prefers its shard's nodes with `--preferred-many=<nodes>` when the
+shard spans multiple NUMA nodes, or `--preferred=<node>` for a single-node shard.
+Explicit `--numa-bind` or binding lists retain strict `--membind=<nodes>`.
+When you need a custom CPU policy, add `--numa-bind-cpus` and vLLM will switch
+to `--physcpubind=<cpu-list>`.
+
+Automatic eligibility and topology validation happen in each local launcher
+before starting its first bound subprocess, using freshly discovered topology.
+The mapping must cover all visible GPUs and local workers, and each mapped NUMA
+node must have CPUs. The resolved decision and mapping are passed to spawned
+children, so an already-bound EngineCore does not repeat detection under its
+restricted CPU affinity.
+PCP workers use the full TP × PCP × PP shard size for local DP GPU offsets;
+EngineCore's CPU affinity covers all workers in its shard.
+Multi-node multiprocessing launchers resolve their own host-local mapping;
+NUMA node IDs are never interpreted as cluster-wide IDs.
+
+Before each bound launch, vLLM probes the selected policy with
+`numactl <args> true`. If CPU-and-memory binding is rejected, it retries with
+CPU-only binding; if that is also rejected, the subprocess starts unbound.
+Logs report the selected policy or fallback. If `--preferred-many` is unsupported,
+automatic mode falls back to CPU-only binding, never strict memory binding.
+These probes test policy acceptance, not future allocation capacity.
+
+These `--numa-bind*` options only apply to GPU execution processes. They do not
+configure the CPU backend's separate thread-affinity controls. Automatic
+GPU-to-NUMA detection is currently implemented for CUDA/NVML-based as well as
+ROCM-based platforms; other GPU backends must provide explicit binding lists if
+they use these options.
+
+`--numa-bind-nodes` takes one non-negative NUMA node index per visible GPU, in
+the same order as the GPU indices.
+`--numa-bind-cpus` takes one `numactl` CPU list per visible GPU, in the same
+order as the GPU indices. Each CPU list must use
+`numactl --physcpubind` syntax such as `0-3`, `0,2,4-7`, or `16-31,48-63`.
+
+```bash
+# Require binding, auto-detecting NUMA nodes for visible GPUs
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --tensor-parallel-size 4 \
+  --numa-bind
+
+# Explicit NUMA-node mapping
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --tensor-parallel-size 4 \
+  --numa-bind \
+  --numa-bind-nodes 0 0 1 1
+
+# Explicit CPU pinning, useful for PCT or other high-frequency core layouts
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --tensor-parallel-size 4 \
+  --numa-bind \
+  --numa-bind-nodes 0 0 1 1 \
+  --numa-bind-cpus 0-3 4-7 48-51 52-55
+```
+
+Notes:
+
+- The CLI defaults to `spawn` when `VLLM_WORKER_MULTIPROC_METHOD` is unset. Automatic NUMA binding never changes the start method: if it is `fork`, default binding stays off. Python API usage normally defaults to `fork`; set `VLLM_WORKER_MULTIPROC_METHOD=spawn` to allow binding and follow Python's `if __name__ == "__main__":` requirements.
+- Automatic memory preference permits allocations on other NUMA nodes when local memory is unavailable. Explicit `--numa-bind` still uses `--membind`, which restricts host allocations to the selected nodes; for host-memory-heavy setups (e.g. large CPU KV offload), avoid explicit strict binding if workers need memory from other nodes. The policy probes do not check allocation capacity or container memory limits.
+- Automatic detection relies on NVML (CUDA) or amdsmi (ROCm) and NUMA support from the host. If it cannot determine the mapping reliably, default mode starts unbound; pass `--numa-bind-nodes` to provide a mapping explicitly.
+- Explicit `--numa-bind-nodes` and `--numa-bind-cpus` values must be valid `numactl` inputs. vLLM does a small amount of validation, but the effective binding semantics are still determined by `numactl`.
+- The current implementation binds GPU execution processes such as `EngineCore` and multiprocessing workers. It does not apply NUMA binding to frontend API server processes or the DP coordinator.
+- Ray actors are not bound by the multiprocessing executable wrapper. Enabling automatic NUMA binding for Ray requires a separate actor-launch implementation.
+- In containerized environments, NUMA policy syscalls may require extra permissions, such as `--cap-add SYS_NICE` when running via `docker run`.
+
+### CPU Backend Thread Affinity
+
+The CPU backend uses a different mechanism from `--numa-bind`. CPU execution is
+configured through CPU-specific environment variables such as
+`VLLM_CPU_OMP_THREADS_BIND`, `VLLM_CPU_NUM_OF_RESERVED_CPU`, and
+`CPU_VISIBLE_MEMORY_NODES`, rather than the GPU-oriented `--numa-bind*` CLI
+options.
+
+By default, `VLLM_CPU_OMP_THREADS_BIND=auto` derives OpenMP placement from the
+available CPU and NUMA topology for each CPU worker. To override the automatic
+policy, set `VLLM_CPU_OMP_THREADS_BIND` explicitly using the CPU list format
+documented for the CPU backend, or use `nobind` to disable this behavior.
+
+For the current CPU backend setup and tuning guidance, see:
+
+- [Related runtime environment variables](../getting_started/installation/cpu.md#related-runtime-environment-variables)
+- [How to decide `VLLM_CPU_OMP_THREADS_BIND`](../getting_started/installation/cpu.md#how-to-decide-vllm_cpu_omp_threads_bind)
+
+The GPU-only `--numa-bind`, `--numa-bind-nodes`, and `--numa-bind-cpus` options
+do not configure CPU worker affinity.
 
 ### Batch-level DP for Multi-Modal Encoders
 
@@ -174,16 +344,50 @@ Regardless, you need to set `mm_encoder_tp_mode="data"` in engine arguments to u
 
 Known supported models (with corresponding benchmarks):
 
-- dots_ocr (<gh-pr:25466>)
-- GLM-4.1V or above (<gh-pr:23168>)
-- InternVL (<gh-pr:23909>)
-- Kimi-VL (<gh-pr:23817>)
-- Llama4 (<gh-pr:18368>)
-- MiniCPM-V-2.5 or above (<gh-pr:23327>, <gh-pr:23948>)
-- Qwen2-VL or above (<gh-pr:22742>, <gh-pr:24955>, <gh-pr:25445>)
-- Step3 (<gh-pr:22697>)
+- dots_ocr (<https://github.com/vllm-project/vllm/pull/25466>)
+- GLM-4.1V or above (<https://github.com/vllm-project/vllm/pull/23168>)
+- InternVL (<https://github.com/vllm-project/vllm/pull/23909>)
+- Kimi-VL (<https://github.com/vllm-project/vllm/pull/23817>)
+- Llama4 (<https://github.com/vllm-project/vllm/pull/18368>)
+- MiniCPM-V-2.5 or above (<https://github.com/vllm-project/vllm/pull/23327>, <https://github.com/vllm-project/vllm/pull/23948>)
+- Qwen2-VL or above (<https://github.com/vllm-project/vllm/pull/22742>, <https://github.com/vllm-project/vllm/pull/24955>, <https://github.com/vllm-project/vllm/pull/25445>)
+- Step3 (<https://github.com/vllm-project/vllm/pull/22697>)
 
 ## Input Processing
+
+### fastokens Backend
+
+By default vLLM uses the standard Hugging Face `tokenizers` library to power
+the fast tokenizer. For BPE tokenizers (Qwen, Llama, DeepSeek, GPT-OSS, etc.)
+you can switch to the [fastokens](https://github.com/crusoecloud/fastokens)
+Rust backend, a drop-in replacement that's substantially faster on
+encode/decode and on streaming detokenization. `VLLM_USE_FASTOKENS` is
+available in vLLM v0.23.0 and later. If your installed vLLM version does not
+recognize the environment variable, upgrade vLLM before enabling the override:
+
+```console
+VLLM_USE_FASTOKENS=1 vllm serve Qwen/Qwen3-8B
+```
+
+Equivalent in the offline API:
+
+```python
+import os
+os.environ["VLLM_USE_FASTOKENS"] = "1"
+
+from vllm import LLM
+llm = LLM(model="Qwen/Qwen3-8B")
+```
+
+The `fastokens` Python package (>= 0.3.5) must be installed; if it isn't, or
+is older, vLLM raises a clear `ImportError` at tokenizer load. The override applies to
+any `--tokenizer-mode` that ends up loading an HF fast tokenizer (`hf`,
+`deepseek_v32`, `deepseek_v4`, …). Models that don't use the HF
+fast tokenizer (`mistral`, `kimi_audio`) ignore the flag.
+
+Tokenizer-bound workloads — long shared prefixes, bursty short prompts,
+batch detokenization — see the largest wins. If your bottleneck is GPU
+prefill/decode, the tokenizer change is unlikely to be visible end-to-end.
 
 ### Parallel Processing
 
@@ -249,6 +453,14 @@ processes.
 ### Configuration
 
 You can adjust the size of the cache by setting the value of `mm_processor_cache_gb` (default 4 GiB).
+A processed item larger than this budget is served uncached (with a warning)
+instead of failing engine startup; raise `mm_processor_cache_gb` if you want
+those items cached.
+
+With processor-only caching, a request can contain more processed multi-modal
+data than the cache budget. Cached tensors and prompt updates needed by the
+request remain referenced while its inputs are merged, even if they are evicted
+from the LRU. The budget limits cache storage, not transient per-request memory.
 
 If you do not benefit much from the cache, you can disable both IPC
 and processor caching completely via `mm_processor_cache_gb=0`.
@@ -282,11 +494,63 @@ llm = LLM(
 Based on the configuration, the content of the multi-modal caches on `P0` and `P1` are as follows:
 
 | mm_processor_cache_type | Cache Type | `P0` Cache | `P1` Engine Cache | `P1` Worker Cache | Max. Memory |
-|-------------------|-------------|------------|------------|-------------|-------------|
+| ----------------- | ----------- | ---------- | ---------- | ----------- | ----------- |
 | lru | Processor Caching | K + V | N/A | N/A | `mm_processor_cache_gb * data_parallel_size` |
 | lru | Key-Replicated Caching | K | K + V | N/A | `mm_processor_cache_gb * api_server_count` |
 | shm | Shared Memory Caching | K | N/A | V | `mm_processor_cache_gb * api_server_count` |
 | N/A | Disabled | N/A | N/A | N/A | `0` |
 
-K: Stores the hashes of multi-modal items  
+K: Stores the hashes of multi-modal items
 V: Stores the processed tensor data of multi-modal items
+
+## CPU Resources for GPU Deployments
+
+vLLM V1 uses a multi-process architecture (see [V1 Process Architecture](../design/arch_overview.md#v1-process-architecture)) where each process requires CPU resources. Underprovisioning CPU cores is a common source of performance degradation, especially in virtualized environments.
+
+### Minimum CPU Requirements
+
+For a deployment with `N` GPUs, there are at minimum:
+
+- **1 API server process** -- handles HTTP requests, tokenization, and input processing
+- **1 engine core process** -- runs the scheduler and coordinates GPU workers
+- **N GPU worker processes** -- one per GPU, executes model forward passes
+
+This means there are always at least **`2 + N` processes** competing for CPU time.
+
+!!! warning
+    Using fewer physical CPU cores than processes will cause contention and significantly degrade throughput and latency. The engine core process runs a busy loop and is particularly sensitive to CPU starvation.
+
+The minimum is `2 + N` physical cores (1 for the API server, 1 for the engine core, and 1 per GPU worker). In practice, allocating more cores improves performance because the OS, PyTorch background threads, and other system processes also need CPU time.
+
+!!! important
+    Please note we are referring to **physical CPU cores** here. If your system has hyperthreading enabled, then 1 vCPU = 1 hyperthread = 1/2 physical CPU core, so you need `2 x (2 + N)` minimum vCPUs.
+
+### Data Parallel and Multi-API Server Deployments
+
+When using data parallelism or multiple API servers, the CPU requirements increase:
+
+```console
+Minimum physical cores = A + DP + N + (1 if DP > 1 else 0)
+```
+
+where `A` is the API server count (defaults to `DP`), `DP` is the data parallel size, and `N` is the total number of GPUs. For example, with `DP=4, TP=2` on 8 GPUs:
+
+```console
+4 API servers + 4 engine cores + 8 GPU workers + 1 DP coordinator = 17 processes
+```
+
+### Performance Impact
+
+CPU underprovisioning particularly impacts:
+
+- **Input processing throughput** -- tokenization, chat template rendering, and multi-modal data loading all run on CPU
+- **Scheduling latency** -- the engine core scheduler runs on CPU and directly affects how quickly new tokens are dispatched to the GPU workers
+- **Output processing** -- detokenization, networking, and especially streaming token responses use CPU cycles
+
+If you observe that GPU utilization is lower than expected, CPU contention may be the bottleneck. Increasing the number of available CPU cores and even the clock speed can significantly improve end-to-end performance.
+
+## Attention Backend Selection
+
+vLLM supports multiple attention backends optimized for different hardware and use cases. The backend is automatically selected based on your GPU architecture, model type, and configuration, but you can also manually specify one for optimal performance.
+
+For detailed information on available backends, their feature support, and how to configure them, see the [Attention Backend Feature Support](../design/attention_backends.md) documentation.

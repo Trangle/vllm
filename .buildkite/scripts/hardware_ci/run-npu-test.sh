@@ -41,6 +41,7 @@ get_config() {
         echo "Error: file '${TEST_RUN_CONFIG_FILE}' does not exist in the warehouse" >&2
         exit 1
     fi
+    # shellcheck source=/dev/null
     source "${TEST_RUN_CONFIG_FILE}"
     echo "Base docker image name that get from configuration: ${BASE_IMAGE_NAME}"
     return 0
@@ -48,9 +49,8 @@ get_config() {
 
 # get test running configuration.
 fetch_vllm_test_cfg
-get_config
 # Check if the function call was successful. If not, exit the script.
-if [ $? -ne 0 ]; then
+if ! get_config; then
   exit 1
 fi
 
@@ -62,43 +62,30 @@ agent_idx=$(echo "${BUILDKITE_AGENT_NAME}" | awk -F'-' '{print $(NF-1)}')
 echo "agent_idx: ${agent_idx}"
 builder_name="cachebuilder${agent_idx}"
 builder_cache_dir="/mnt/docker-cache${agent_idx}"
-mkdir -p ${builder_cache_dir}
+mkdir -p "${builder_cache_dir}"
 
 # Try building the docker image
 cat <<EOF | DOCKER_BUILDKIT=1 docker build \
-    --add-host cache-service-vllm.nginx-pypi-cache.svc.cluster.local:${PYPI_CACHE_HOST} \
-    --builder ${builder_name} --cache-from type=local,src=${builder_cache_dir} \
-                           --cache-to type=local,dest=${builder_cache_dir},mode=max \
-    --progress=plain --load -t ${image_name} -f - .
+    --add-host cache-service-vllm.nginx-pypi-cache.svc.cluster.local:"${PYPI_CACHE_HOST}" \
+    --builder "${builder_name}" --cache-from type=local,src="${builder_cache_dir}" \
+                           --cache-to type=local,dest="${builder_cache_dir}",mode=max \
+    --progress=plain --load -t "${image_name}" -f - .
 FROM ${BASE_IMAGE_NAME}
 
 # Define environments
 ENV DEBIAN_FRONTEND=noninteractive
+ENV SOC_VERSION="ascend910b1"
 
 RUN pip config set global.index-url http://cache-service-vllm.nginx-pypi-cache.svc.cluster.local:${PYPI_CACHE_PORT}/pypi/simple && \
-    pip config set global.trusted-host cache-service-vllm.nginx-pypi-cache.svc.cluster.local && \
-    apt-get update -y && \
-    apt-get install -y python3-pip git vim wget net-tools gcc g++ cmake libnuma-dev && \
-    rm -rf /var/cache/apt/* && \
-    rm -rf /var/lib/apt/lists/*
+    pip config set global.trusted-host cache-service-vllm.nginx-pypi-cache.svc.cluster.local
 
 # Install for pytest to make the docker build cache layer always valid
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install pytest>=6.0  modelscope
+    pip install pytest>=6.0
 
 WORKDIR /workspace/vllm
 
-# Install vLLM dependencies in advance. Effect: As long as common.txt remains unchanged, the docker cache layer will be valid.
-COPY requirements/common.txt /workspace/vllm/requirements/common.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements/common.txt
-
 COPY . .
-
-# Install vLLM
-RUN --mount=type=cache,target=/root/.cache/pip \
-    VLLM_TARGET_DEVICE="empty" python3 -m pip install -v -e /workspace/vllm/ --extra-index https://download.pytorch.org/whl/cpu/ && \
-    python3 -m pip uninstall -y triton
 
 # Install vllm-ascend
 WORKDIR /workspace
@@ -106,17 +93,6 @@ ARG VLLM_ASCEND_REPO=https://github.com/vllm-project/vllm-ascend.git
 ARG VLLM_ASCEND_TAG=main
 RUN git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/" && \
     git clone --depth 1 \$VLLM_ASCEND_REPO --branch \$VLLM_ASCEND_TAG /workspace/vllm-ascend
-
-# Install vllm dependencies in advance. Effect: As long as common.txt remains unchanged, the docker cache layer will be valid.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /workspace/vllm-ascend/requirements.txt
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    source /usr/local/Ascend/nnal/atb/set_env.sh && \
-    export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
-    python3 -m pip install -v -e /workspace/vllm-ascend/ --extra-index https://download.pytorch.org/whl/cpu/
 
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 ENV VLLM_USE_MODELSCOPE=True
@@ -138,7 +114,7 @@ trap remove_docker_container EXIT
 # Generate corresponding --device args based on BUILDKITE_AGENT_NAME
 # Ascend NPU BUILDKITE_AGENT_NAME format is {hostname}-{agent_idx}-{npu_card_num}cards, and agent_idx starts from 1.
 #   e.g. atlas-a2-001-1-2cards means this is the 1-th agent on atlas-a2-001 host, and it has 2 NPU cards.
-#   returns --device /dev/davinci0 --device /dev/davinci1
+#   returns one argument per line: --device, /dev/davinciX, ...
 parse_and_gen_devices() {
     local input="$1"
     local index cards_num
@@ -150,29 +126,24 @@ parse_and_gen_devices() {
         return 1
     fi
 
-    local devices=""
     local i=0
     while (( i < cards_num )); do
         local dev_idx=$(((index - 1)*cards_num + i ))
-        devices="$devices --device /dev/davinci${dev_idx}"
+        printf '%s\n' "--device"
+        printf '%s\n' "/dev/davinci${dev_idx}"
         ((i++))
     done
-
-    # trim leading space
-    devices="${devices#"${devices%%[![:space:]]*}"}"
-    # Output devices: assigned to the caller variable
-    printf '%s' "$devices"
 }
 
-devices=$(parse_and_gen_devices "${BUILDKITE_AGENT_NAME}") || exit 1
+mapfile -t device_args < <(parse_and_gen_devices "${BUILDKITE_AGENT_NAME}") || exit 1
 
 # Run the image and execute the Out-Of-Tree (OOT) platform interface test case on Ascend NPU hardware.
 # This test checks whether the OOT platform interface is functioning properly in conjunction with
 # the hardware plugin vllm-ascend.
 model_cache_dir=/mnt/modelscope${agent_idx}
-mkdir -p ${model_cache_dir}
+mkdir -p "${model_cache_dir}"
 docker run \
-    ${devices} \
+    "${device_args[@]}" \
     --device /dev/davinci_manager \
     --device /dev/devmm_svm \
     --device /dev/hisi_hdc \
@@ -181,11 +152,11 @@ docker run \
     -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
     -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
-    -v ${model_cache_dir}:/root/.cache/modelscope \
+    -v "${model_cache_dir}":/root/.cache/modelscope \
     --entrypoint="" \
     --name "${container_name}" \
     "${image_name}" \
     bash -c '
     set -e
-    pytest -v -s tests/e2e/vllm_interface/
+    pytest --noconftest -v -s tests/e2e/vllm_interface/test_vllm_pr_interface_compatibility.py
 '

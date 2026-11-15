@@ -1,6 +1,12 @@
 #pragma once
 
-#include <torch/all.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Half.h>
+
+// TorchTensor (not Tensor) avoids ambiguity with cute::Tensor.
+using TorchTensor = torch::stable::Tensor;
 
 #include "cute/layout.hpp"
 #include "cutlass/layout/matrix.h"
@@ -55,35 +61,35 @@ CUTE_HOST_DEVICE constexpr auto make_shape_from_idx(F&& f) {
 // If `tensor.dim() < rank(Stride{})`, the shape is padded with 1s and the extra
 // strides are set to be 0 or 1.
 template <typename Stride>
-static inline auto make_cute_layout(torch::Tensor const& tensor,
+static inline auto make_cute_layout(TorchTensor const& tensor,
                                     std::string_view name = "tensor") {
-  TORCH_CHECK(tensor.dim() <= rank(Stride{}));
-  auto stride = cute::transform_with_idx(
-      Stride{}, [&](auto const& stride_ele, auto const& idx) {
-        using StrideEle = std::decay_t<decltype(stride_ele)>;
+  STD_TORCH_CHECK(tensor.dim() <= rank(Stride{}));
+  auto stride = cute::transform_with_idx(Stride{}, [&](auto const& stride_ele,
+                                                       auto const& idx) {
+    using StrideEle = std::decay_t<decltype(stride_ele)>;
 
-        if (idx < tensor.dim()) {
-          if constexpr (cute::is_static_v<StrideEle>) {
-            TORCH_CHECK(StrideEle::value == tensor.stride(idx), "Expected ",
+    if (idx < tensor.dim()) {
+      if constexpr (cute::is_static_v<StrideEle>) {
+        STD_TORCH_CHECK(StrideEle::value == tensor.stride(idx), "Expected ",
                         name, ".stride(", idx, ") to be ", StrideEle::value);
-            return StrideEle{};
-          } else {
-            if (tensor.size(idx) == 1) {
-              // use 0 stride for dim with size 1, this is easier for
-              // cute/cutlass to optimize (helps the TMA code flatten dims)
-              return StrideEle{0};
-            } else {
-              return tensor.stride(idx);
-            }
-          }
+        return StrideEle{};
+      } else {
+        if (tensor.size(idx) == 1) {
+          // use 0 stride for dim with size 1, this is easier for
+          // cute/cutlass to optimize (helps the TMA code flatten dims)
+          return StrideEle{0};
         } else {
-          // Extra strides are assumed to be 0 or 1
-          if constexpr (cute::is_static_v<StrideEle>) {
-            static_assert(StrideEle::value == 0 || StrideEle::value == 1);
-          }
-          return StrideEle{};
+          return tensor.stride(idx);
         }
-      });
+      }
+    } else {
+      // Extra strides are assumed to be 0 or 1
+      if constexpr (cute::is_static_v<StrideEle>) {
+        static_assert(StrideEle::value == 0 || StrideEle::value == 1);
+      }
+      return StrideEle{};
+    }
+  });
 
   auto shape = cute::make_shape_from_idx<rank(Stride{})>([&](auto const& idx) {
     if (idx < tensor.dim())
@@ -97,7 +103,7 @@ static inline auto make_cute_layout(torch::Tensor const& tensor,
 
 template <typename Stride>
 static inline auto maybe_make_cute_layout(
-    std::optional<torch::Tensor> const& tensor,
+    std::optional<TorchTensor> const& tensor,
     std::string_view name = "tensor") {
   using Layout = decltype(make_cute_layout<Stride>(*tensor));
 
@@ -109,33 +115,11 @@ static inline auto maybe_make_cute_layout(
 }
 
 //
-//  Torch Type to Cutlass Type (equivalent_cutlass_type)
+// Cutlass Type to Torch Type (equivalent_scalar_type)
 //
 
-template <typename T>
-struct equivalent_cutlass_type {
-  using type = T;
-};
-
-template <typename T>
-using equivalent_cutlass_type_t = typename equivalent_cutlass_type<T>::type;
-
-template <>
-struct equivalent_cutlass_type<c10::Half> {
-  using type = cutlass::half_t;
-};
-
-template <>
-struct equivalent_cutlass_type<c10::BFloat16> {
-  using type = cutlass::bfloat16_t;
-};
-
-//
-// equivalent_scalar_t (basically inverse of equivalent_cutlass_type)
-//
-
-// Return a `c10::CppTypeToScalarType<T>` compatible type, i.e. get the C++ from
-// c10 that is equivalent to T, e.g.: `cutlass::half_t -> c10::Half`
+// Return a `torch::headeronly::CppTypeToScalarType<T>` compatible type, i.e.
+// get the C++ type equivalent to T, e.g.: `cutlass::half_t -> Half`
 template <typename T>
 struct equivalent_scalar_type {
   using type = T;
@@ -146,15 +130,15 @@ using equivalent_scalar_type_t = typename equivalent_scalar_type<T>::type;
 
 template <>
 struct equivalent_scalar_type<cutlass::half_t> {
-  using type = c10::Half;
+  using type = torch::headeronly::Half;
 };
 
 template <>
 struct equivalent_scalar_type<cutlass::bfloat16_t> {
-  using type = c10::BFloat16;
+  using type = torch::headeronly::BFloat16;
 };
 
-// get equivalent c10::ScalarType tag from compile time type
+// get equivalent torch::headeronly::ScalarType tag from compile time type
 template <typename T>
-static inline constexpr c10::ScalarType equivalent_scalar_type_v =
-    c10::CppTypeToScalarType<equivalent_scalar_type_t<T>>::value;
+static inline constexpr torch::headeronly::ScalarType equivalent_scalar_type_v =
+    torch::headeronly::CppTypeToScalarType<equivalent_scalar_type_t<T>>::value;

@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
-from transformers.configuration_utils import PretrainedConfig
+from transformers.configuration_utils import PreTrainedConfig
 
 
-class Step3VisionEncoderConfig(PretrainedConfig):
+class Step3VisionEncoderConfig(PreTrainedConfig):
     model_type = "step3_vision_encoder"
 
     def __init__(
@@ -35,9 +35,10 @@ class Step3VisionEncoderConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-class Step3TextConfig(PretrainedConfig):
+class Step3TextConfig(PreTrainedConfig):
     model_type = "step3_text"
     architectures = ["Step3TextForCausalLM"]
+    default_theta = 500000.0
 
     def __init__(
         self,
@@ -52,8 +53,7 @@ class Step3TextConfig(PretrainedConfig):
         moe_intermediate_size: int = 5120,
         moe_num_experts: int = 48,
         moe_top_k: int = 3,
-        rope_theta: float = 500000,
-        rope_scaling: dict[str, Any] | None = None,
+        rope_parameters: dict[str, Any] | None = None,
         max_position_embedding: int = 65536,
         share_expert_dim: int = 5120,
         share_q_dim: int = 2048,
@@ -130,8 +130,7 @@ class Step3TextConfig(PretrainedConfig):
         self.moe_intermediate_size = moe_intermediate_size
         self.moe_num_experts = moe_num_experts
         self.moe_top_k = moe_top_k
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        self.rope_parameters = rope_parameters or {}
         self.max_position_embedding = max_position_embedding
         self.share_expert_dim = share_expert_dim
         self.share_q_dim = share_q_dim
@@ -142,7 +141,7 @@ class Step3TextConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-class Step3VLConfig(PretrainedConfig):
+class Step3VLConfig(PreTrainedConfig):
     model_type = "step3_vl"
 
     def __init__(

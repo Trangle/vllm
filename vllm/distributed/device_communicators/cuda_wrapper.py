@@ -14,6 +14,8 @@ import torch  # noqa
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.utils.system_utils import find_loaded_library
 
 logger = init_logger(__name__)
 
@@ -29,38 +31,11 @@ class cudaIpcMemHandle_t(ctypes.Structure):
     _fields_ = [("internal", ctypes.c_byte * 128)]
 
 
-@dataclass
+@dataclass(slots=True)
 class Function:
     name: str
     restype: Any
     argtypes: list[Any]
-
-
-def find_loaded_library(lib_name) -> str | None:
-    """
-    According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
-    the file `/proc/self/maps` contains the memory maps of the process, which includes the
-    shared libraries loaded by the process. We can use this file to find the path of the
-    a loaded library.
-    """  # noqa
-    found = False
-    with open("/proc/self/maps") as f:
-        for line in f:
-            if lib_name in line:
-                found = True
-                break
-    if not found:
-        # the library is not loaded in the current process
-        return None
-    # if lib_name is libcudart, we need to match a line with:
-    # address /path/to/libcudart-hash.so.11.0
-    start = line.index("/")
-    path = line[start:].strip()
-    filename = path.split("/")[-1]
-    assert filename.rpartition(".so")[0].startswith(lib_name), (
-        f"Unexpected filename: {filename} for library {lib_name}"
-    )
-    return path
 
 
 class CudaRTLibrary:
@@ -91,7 +66,7 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, cudaMemcpyKind],
         ),
-        # cudaError_t cudaIpcGetMemHandle ( cudaIpcMemHandle_t* handle, void* devPtr ) # noqa
+        # cudaError_t cudaIpcGetMemHandle ( cudaIpcMemHandle_t* handle, void* devPtr )
         Function(
             "cudaIpcGetMemHandle",
             cudaError_t,
@@ -103,7 +78,37 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint],
         ),
+        # cudaError_t cudaIpcCloseMemHandle ( void* devPtr )
+        Function("cudaIpcCloseMemHandle", cudaError_t, [ctypes.c_void_p]),
+        # cudaError_t cudaHostRegister ( void* ptr, size_t size, unsigned int flags )
+        Function(
+            "cudaHostRegister",
+            cudaError_t,
+            [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint],
+        ),
+        # cudaError_t cudaHostUnregister ( void* ptr )
+        Function("cudaHostUnregister", cudaError_t, [ctypes.c_void_p]),
+        # cudaError_t cudaGetLastError ( void )
+        Function("cudaGetLastError", cudaError_t, []),
     ]
+
+    # https://rocm.docs.amd.com/projects/HIPIFY/en/latest/tables/CUDA_Runtime_API_functions_supported_by_HIP.html
+    cuda_to_hip_mapping = {
+        "cudaSetDevice": "hipSetDevice",
+        "cudaDeviceSynchronize": "hipDeviceSynchronize",
+        "cudaDeviceReset": "hipDeviceReset",
+        "cudaGetErrorString": "hipGetErrorString",
+        "cudaMalloc": "hipMalloc",
+        "cudaFree": "hipFree",
+        "cudaMemset": "hipMemset",
+        "cudaMemcpy": "hipMemcpy",
+        "cudaIpcGetMemHandle": "hipIpcGetMemHandle",
+        "cudaIpcOpenMemHandle": "hipIpcOpenMemHandle",
+        "cudaIpcCloseMemHandle": "hipIpcCloseMemHandle",
+        "cudaHostRegister": "hipHostRegister",
+        "cudaHostUnregister": "hipHostUnregister",
+        "cudaGetLastError": "hipGetLastError",
+    }
 
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
@@ -115,9 +120,12 @@ class CudaRTLibrary:
 
     def __init__(self, so_file: str | None = None):
         if so_file is None:
-            so_file = find_loaded_library("libcudart")
-            if so_file is None:
-                so_file = envs.VLLM_CUDART_SO_PATH  # fallback to env var
+            so_file = (
+                find_loaded_library(
+                    "libamdhip64" if current_platform.is_rocm() else "libcudart"
+                )
+                or envs.VLLM_CUDART_SO_PATH  # fallback to env var
+            )
             assert so_file is not None, (
                 "libcudart is not loaded in the current process, "
                 "try setting VLLM_CUDART_SO_PATH"
@@ -130,7 +138,12 @@ class CudaRTLibrary:
         if so_file not in CudaRTLibrary.path_to_dict_mapping:
             _funcs = {}
             for func in CudaRTLibrary.exported_functions:
-                f = getattr(self.lib, func.name)
+                f = getattr(
+                    self.lib,
+                    CudaRTLibrary.cuda_to_hip_mapping[func.name]
+                    if current_platform.is_rocm()
+                    else func.name,
+                )
                 f.restype = func.restype
                 f.argtypes = func.argtypes
                 _funcs[func.name] = f
@@ -147,6 +160,21 @@ class CudaRTLibrary:
 
     def cudaSetDevice(self, device: int) -> None:
         self.CUDART_CHECK(self.funcs["cudaSetDevice"](device))
+
+    def cudaStreamCreateWithFlags(self, flags: int) -> int:
+        """Create a stream on the current device; returns its raw handle.
+
+        Only used under NVIDIA Confidential Computing, so unlike
+        `exported_functions` it is resolved on use: ROCm and non-CC processes
+        never look it up.
+        """
+        create = self.lib.cudaStreamCreateWithFlags
+        create.restype = cudaError_t
+        create.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+        stream = ctypes.c_void_p()
+        self.CUDART_CHECK(create(ctypes.byref(stream), flags))
+        assert stream.value is not None
+        return stream.value
 
     def cudaDeviceSynchronize(self) -> None:
         self.CUDART_CHECK(self.funcs["cudaDeviceSynchronize"]())
@@ -188,3 +216,19 @@ class CudaRTLibrary:
             )
         )
         return devPtr
+
+    def cudaIpcCloseMemHandle(self, devPtr: ctypes.c_void_p) -> None:
+        self.CUDART_CHECK(self.funcs["cudaIpcCloseMemHandle"](devPtr))
+
+    def cudaHostRegister(self, ptr: int, size: int, flags: int = 0) -> int:
+        """Return the raw error code instead of raising, since callers can
+        fall back to pageable memory. Drain a failure with cudaGetLastError."""
+        return self.funcs["cudaHostRegister"](ctypes.c_void_p(ptr), size, flags)
+
+    def cudaHostUnregister(self, ptr: int) -> int:
+        """Return the raw error code instead of raising."""
+        return self.funcs["cudaHostUnregister"](ctypes.c_void_p(ptr))
+
+    def cudaGetLastError(self) -> int:
+        """Return and clear the error pending on this thread."""
+        return self.funcs["cudaGetLastError"]()

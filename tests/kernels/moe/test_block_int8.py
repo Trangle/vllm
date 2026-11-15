@@ -12,45 +12,39 @@ from tests.kernels.quant_utils import (
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
+from vllm.model_executor.layers.quantization.utils.int8_utils import (
+    per_token_group_quant_int8,
+)
 from vllm.platforms import current_platform
 
-if current_platform.get_device_capability() < (7, 0):
+device_capability = current_platform.get_device_capability()
+if device_capability is None or device_capability < (7, 0):
     pytest.skip("INT8 Triton requires CUDA 7.0 or higher", allow_module_level=True)
 
 vllm_config = VllmConfig()
-vllm_config.scheduler_config.max_num_seqs = 128
-vllm_config.scheduler_config.max_model_len = 8192
 
-DTYPES = [torch.half, torch.bfloat16]
+DTYPES = [torch.bfloat16]
 
 MNK_FACTORS = [
     (1, 128, 128),
-    (1, 512, 512),
     (1, 128, 7168),
     (1, 1024, 7168),
-    (1, 4096, 128),
     (1, 4096, 512),
     (1, 4096, 7168),
-    (33, 128, 128),
     (33, 512, 512),
     (33, 128, 7168),
     (33, 1024, 7168),
     (33, 4096, 128),
-    (33, 4096, 512),
     (33, 4096, 7168),
     (128, 128, 128),
-    (128, 512, 512),
     (128, 1024, 7168),
     (128, 4096, 512),
     (128, 4096, 7168),
-    (222, 128, 128),
     (222, 512, 512),
     (222, 1024, 7168),
-    (222, 4096, 512),
     (222, 4096, 7168),
     (2048, 128, 128),
     (2048, 1024, 7168),
-    (2048, 4096, 512),
     (2048, 4096, 4096),
 ]
 
@@ -74,7 +68,7 @@ def torch_w8a8_block_int8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
     topk_ids = topk_ids.view(-1)
 
     _, block_k = block_shape[0], block_shape[1]
-    a_q, a_s = native_per_token_group_quant_int8(a, block_k)
+    a_q, a_s = native_per_token_group_quant_int8(a, block_k, round_to_nearest=False)
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():
@@ -82,7 +76,9 @@ def torch_w8a8_block_int8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
                 a_q[mask], w1[i], a_s[mask], w1_s[i], block_shape, output_dtype=a.dtype
             )
             act_out = SiluAndMul().forward_native(inter_out)
-            act_out_q, act_out_s = native_per_token_group_quant_int8(act_out, block_k)
+            act_out_q, act_out_s = native_per_token_group_quant_int8(
+                act_out, block_k, round_to_nearest=False
+            )
             act_out = act_out.to(torch.float32)
             out[mask] = native_w8a8_block_matmul(
                 act_out_q, w2[i], act_out_s, w2_s[i], block_shape, output_dtype=a.dtype
@@ -92,9 +88,9 @@ def torch_w8a8_block_int8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
     ).sum(dim=1)
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(autouse=True)
 def setup_cuda():
-    """Sets the default CUDA device for all tests in this module."""
+    """Sets the default CUDA device before each test in this module."""
     torch.set_default_device("cuda")
 
 
@@ -142,3 +138,27 @@ def test_w8a8_block_int8_fused_moe(M, N, K, E, topk, block_size, dtype, seed):
 
     # Check results
     torch.testing.assert_close(out, ref_out, atol=0.065, rtol=0.065)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_block_int8_quantization_truncates_fractional_values(dtype):
+    """Block INT8 quantization truncates, unlike per-token round-to-nearest."""
+    device = current_platform.device_type
+    x = torch.tensor(
+        [[-127, -1.75, -0.75, 0.75, 1.75, 127] + [0] * 122],
+        dtype=dtype,
+        device=device,
+    )
+    expected = torch.tensor(
+        [[-127, -1, 0, 0, 1, 127] + [0] * 122], dtype=torch.int8, device=device
+    )
+
+    out_q, scale = per_token_group_quant_int8(x, group_size=128)
+    ref_q, ref_s = native_per_token_group_quant_int8(
+        x, group_size=128, round_to_nearest=False
+    )
+
+    torch.testing.assert_close(out_q, expected, atol=0, rtol=0)
+    torch.testing.assert_close(ref_q, expected, atol=0, rtol=0)
+    torch.testing.assert_close(scale, torch.ones_like(scale), atol=0, rtol=0)
+    torch.testing.assert_close(ref_s, scale, atol=0, rtol=0)

@@ -3,29 +3,32 @@
 
 from collections.abc import Iterable
 from itertools import islice
+from typing import Any
 
 import torch
 import torch.nn as nn
 from transformers import DbrxConfig
 
-from vllm.attention import Attention
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEFactory,
+    GateLinear,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
@@ -59,12 +62,10 @@ class DbrxRouter(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_total_experts = config.ffn_config.moe_num_experts
         self.d_model = config.d_model
-        self.layer = ReplicatedLinear(
+        self.layer = GateLinear(
             self.d_model,
             self.num_total_experts,
-            bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -72,28 +73,17 @@ class DbrxRouter(nn.Module):
         return router_logits
 
 
-class DbrxExperts(FusedMoE):
+class DbrxExperts(RoutedExperts):
     def __init__(
         self,
+        *args,
         config: DbrxConfig,
-        quant_config: QuantizationConfig | None = None,
-        params_dtype: torch.dtype | None = None,
-        prefix: str = "",
+        **kwargs,
     ):
-        super().__init__(
-            num_experts=config.ffn_config.moe_num_experts,
-            top_k=config.ffn_config.moe_top_k,
-            hidden_size=config.d_model,
-            intermediate_size=config.ffn_config.ffn_hidden_size,
-            params_dtype=params_dtype,
-            reduce_results=True,
-            renormalize=True,
-            quant_config=quant_config,
-            tp_size=get_tensor_model_parallel_world_size(),
-            prefix=prefix,
-        )
+        super().__init__(*args, **kwargs)
         self.config = config
         self.d_model = config.d_model
+        self.tp_size = self.moe_config.tp_size
         self.intermediate_size = self.config.ffn_config.ffn_hidden_size // self.tp_size
 
     # Define custom weight loader for dbrx model
@@ -102,8 +92,11 @@ class DbrxExperts(FusedMoE):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         weight_name: str,
-        param_name: str,
-    ):
+        shard_id: str,
+        expert_id: int | None = None,
+        return_success: Any = False,
+    ) -> Any:
+        param_name = shard_id
         tp_rank = get_tensor_model_parallel_rank()
         param_data = param.data
         shard_size = self.intermediate_size
@@ -143,6 +136,7 @@ class DbrxExperts(FusedMoE):
                 param_data[:] = loaded_weight[:, :, shard]
             else:
                 param_data[:] = loaded_weight
+        return True if return_success else None
 
 
 class DbrxMoE(nn.Module):
@@ -168,11 +162,18 @@ class DbrxMoE(nn.Module):
 
         self.router = DbrxRouter(config, self.params_dtype)
 
-        self.experts = DbrxExperts(
-            config=config,
-            quant_config=quant_config,
+        self.experts = FusedMoEFactory(
+            num_experts=config.ffn_config.moe_num_experts,
+            top_k=config.ffn_config.moe_top_k,
+            hidden_size=config.d_model,
+            intermediate_size=config.ffn_config.ffn_hidden_size,
             params_dtype=self.params_dtype,
-            prefix=f"{prefix}.experts",
+            renormalize=True,
+            quant_config=quant_config,
+            tp_size=get_tensor_model_parallel_world_size(),
+            prefix=prefix,
+            routed_experts_cls=DbrxExperts,
+            routed_experts_args={"config": config},
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -198,7 +199,10 @@ class DbrxAttention(nn.Module):
         self.head_dim = self.d_model // self.total_num_heads
         self.total_num_kv_heads = config.attn_config.kv_n_heads
         self.clip_qkv = config.attn_config.clip_qkv
-        self.rope_theta = config.attn_config.rope_theta
+        rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": int(config.attn_config.rope_theta),
+        }
         self.max_position = config.max_seq_len
 
         # pylint: disable=invalid-name
@@ -209,18 +213,19 @@ class DbrxAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.Wqkv",
         )
         self.out_proj = RowParallelLinear(
             self.d_model,
             self.d_model,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.out_proj",
         )
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=self.max_position,
-            base=int(self.rope_theta),
+            rope_parameters=rope_parameters,
             is_neox_style=True,
         )
 
@@ -353,12 +358,12 @@ class DbrxModel(nn.Module):
             ["hidden_states"], config.d_model
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.wte(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         position_ids: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
@@ -367,7 +372,7 @@ class DbrxModel(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
+                hidden_states = self.embed_input_ids(input_ids)
         else:
             assert intermediate_tensors
             hidden_states = intermediate_tensors["hidden_states"]
@@ -390,19 +395,6 @@ class DbrxModel(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
-
             if name.endswith(("w1", "w2", "v1")):
                 name = name + "_weight"
             for param_name, weight_name in expert_params_mapping:
@@ -420,9 +412,10 @@ class DbrxModel(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
                 # Remapping the name of FP8 kv-scale.
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
+                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+                if remapped_name is None:
                     continue
+                name = remapped_name
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -439,31 +432,27 @@ class DbrxForCausalLM(nn.Module, SupportsPP):
         if config.tie_word_embeddings:
             raise ValueError("tie_word_embeddings is not supported for Dbrx models.")
         self.quant_config = quant_config
-        self.unpadded_vocab_size = config.vocab_size
+
         self.transformer = DbrxModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "transformer")
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.d_model,
-            org_num_embeddings=config.vocab_size,
-            padding_size=DEFAULT_VOCAB_PADDING_SIZE,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
-        self.logits_processor = LogitsProcessor(
-            self.unpadded_vocab_size, config.vocab_size
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.transformer.make_empty_intermediate_tensors
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.transformer.get_input_embeddings(input_ids)
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.transformer.embed_input_ids(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

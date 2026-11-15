@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from tests.reasoning.utils import run_reasoning_extraction
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
@@ -13,43 +13,43 @@ REASONING_MODEL_NAME = "baidu/ERNIE-4.5-21B-A3B-Thinking"
 
 
 @pytest.fixture(scope="module")
-def ernie45_tokenizer():
+def ernie45_tokenizer() -> PreTrainedTokenizerBase:
     return AutoTokenizer.from_pretrained(REASONING_MODEL_NAME)
 
 
 # 带 </think>，非stream
 WITH_THINK = {
     "output": "abc</think>def",
-    "reasoning_content": "abc",
+    "reasoning": "abc",
     "content": "def",
 }
 # 带 </think>，stream
 WITH_THINK_STREAM = {
     "output": "abc</think>def",
-    "reasoning_content": "abc",
+    "reasoning": "abc",
     "content": "def",
 }
-# without </think>, all is reasoning_content
+# without </think>, all is reasoning
 WITHOUT_THINK = {
     "output": "abc",
-    "reasoning_content": "abc",
+    "reasoning": "abc",
     "content": None,
 }
-# without </think>, all is reasoning_content
+# without </think>, all is reasoning
 WITHOUT_THINK_STREAM = {
     "output": "abc",
-    "reasoning_content": "abc",
+    "reasoning": "abc",
     "content": None,
 }
 
 COMPLETE_REASONING = {
     "output": "abc</think>",
-    "reasoning_content": "abc",
+    "reasoning": "abc",
     "content": None,
 }
 MULTILINE_REASONING = {
     "output": "abc\nABC</think>def\nDEF",
-    "reasoning_content": "abc\nABC",
+    "reasoning": "abc\nABC",
     "content": "def\nDEF",
 }
 
@@ -120,5 +120,5 @@ def test_reasoning(
 
     print()
 
-    assert reasoning == param_dict["reasoning_content"]
+    assert reasoning == param_dict["reasoning"]
     assert content == param_dict["content"]

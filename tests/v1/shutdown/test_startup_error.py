@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Test that we handle a startup Error and shutdown."""
 
+import inspect
+
 import pytest
 
 from tests.utils import wait_for_gpu_memory_to_clear
@@ -13,19 +15,30 @@ from vllm import LLM
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.model_executor.models.llama import LlamaForCausalLM
-from vllm.utils import cuda_device_count_stateless
+from vllm.platforms import current_platform
 from vllm.v1.engine.async_llm import AsyncLLM
 
-MODELS = ["meta-llama/Llama-3.2-1B"]
+MODELS = ["vllm-project/tiny-random-LlamaForCausalLM"]
 
 
 def evil_method(self, *args, **kwargs):
     """Evil method that raises an exception."""
-
     if get_tensor_model_parallel_rank() == 0:
         raise Exception("Simulated Error in startup!")
 
     return self.model(*args, **kwargs, intermediate_tensors=None)
+
+
+@pytest.fixture
+def evil_method_fixture(spawn_sitecustomize_factory, request):
+    failing_method = request.getfixturevalue("failing_method")
+    lines = [
+        "from vllm.distributed import get_tensor_model_parallel_rank",
+        "from vllm.model_executor.models.llama import LlamaForCausalLM",
+        inspect.getsource(evil_method),
+        f"LlamaForCausalLM.{failing_method} = {evil_method.__name__}",
+    ]
+    spawn_sitecustomize_factory(lines)
 
 
 @pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC)
@@ -33,13 +46,17 @@ def evil_method(self, *args, **kwargs):
 @pytest.mark.parametrize("tensor_parallel_size", [2, 1])
 @pytest.mark.parametrize("failing_method", ["forward", "load_weights"])
 def test_async_llm_startup_error(
-    monkeypatch, model: str, tensor_parallel_size: int, failing_method: str
+    monkeypatch,
+    evil_method_fixture,
+    model: str,
+    tensor_parallel_size: int,
+    failing_method: str,
 ) -> None:
     """Test that AsyncLLM propagates an __init__ error & frees memory.
     Test profiling (forward()) and load weights failures.
     AsyncLLM always uses an MP client.
     """
-    if cuda_device_count_stateless() < tensor_parallel_size:
+    if current_platform.device_count() < tensor_parallel_size:
         pytest.skip(reason="Not enough CUDA devices")
 
     # Monkeypatch an error in the model.
@@ -50,7 +67,7 @@ def test_async_llm_startup_error(
     )
 
     # Confirm we get an exception.
-    with pytest.raises(Exception, match="initialization failed"):
+    with pytest.raises(Exception, match=r"initialization fail(ed|ure)"):
         _ = AsyncLLM.from_engine_args(engine_args)
 
     # Confirm all the processes are cleaned up.
@@ -67,6 +84,7 @@ def test_async_llm_startup_error(
 @pytest.mark.parametrize("failing_method", ["forward", "load_weights"])
 def test_llm_startup_error(
     monkeypatch,
+    evil_method_fixture,
     model: str,
     tensor_parallel_size: int,
     enable_multiprocessing: bool,
@@ -76,9 +94,11 @@ def test_llm_startup_error(
     Test profiling (forward()) and load weights failures.
     TODO(andy) - LLM without multiprocessing.
     """
-    if model != "meta-llama/Llama-3.2-1B":
-        pytest.skip(reason="Only test meta-llama/Llama-3.2-1B")
-    if cuda_device_count_stateless() < tensor_parallel_size:
+    # Skip non-Llama models since we monkeypatch LlamaForCausalLM specifically.
+    # If MODELS list grows, each architecture needs its own test variant.
+    if model != "vllm-project/llama-68m":
+        pytest.skip(reason="Only test vllm-project/llama-68m")
+    if current_platform.device_count() < tensor_parallel_size:
         pytest.skip(reason="Not enough CUDA devices")
 
     with monkeypatch.context() as m:
@@ -90,7 +110,7 @@ def test_llm_startup_error(
 
         with pytest.raises(
             Exception,
-            match="initialization failed"
+            match=r"initialization fail(ed|ure)"
             if enable_multiprocessing
             else "Simulated Error in startup!",
         ):

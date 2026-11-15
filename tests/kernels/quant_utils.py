@@ -4,18 +4,20 @@
 
 import torch
 
-from vllm.model_executor.layers.quantization.utils.quant_utils import group_broadcast
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_fp8_min_max,
+    group_broadcast,
+)
 from vllm.platforms import current_platform
-from vllm.utils import round_up
+from vllm.utils.deep_gemm import _ceil_to_ue8m0, is_deep_gemm_e8m0_used
+from vllm.utils.math_utils import round_up
 
-# Using the default value (240.0) from pytorch will cause accuracy
-# issue on dynamic quantization models. Here use 224.0 for rocm.
-ROCM_FP8FNUZ_MAX = 224.0
 FP8_DTYPE = current_platform.fp8_dtype()
+DEVICE = current_platform.device_type
 
 
 def as_float32_tensor(x: float | torch.Tensor) -> torch.Tensor:
-    return torch.as_tensor(x, dtype=torch.float32, device="cuda")
+    return torch.as_tensor(x, dtype=torch.float32, device=DEVICE)
 
 
 def ref_dynamic_per_token_quant(
@@ -25,21 +27,12 @@ def ref_dynamic_per_token_quant(
     if scale_ub is not None:
         assert quant_dtype == FP8_DTYPE
 
-    qtype_traits = (
-        torch.iinfo(quant_dtype)
-        if quant_dtype == torch.int8
-        else torch.finfo(quant_dtype)
-    )
-    qtype_traits_max = (
-        ROCM_FP8FNUZ_MAX
-        if current_platform.is_rocm() and current_platform.is_fp8_fnuz()
-        else qtype_traits.max
-    )
-    qtype_traits_min = (
-        -ROCM_FP8FNUZ_MAX
-        if current_platform.is_rocm() and current_platform.is_fp8_fnuz()
-        else qtype_traits.min
-    )
+    if quant_dtype == torch.int8:
+        qtype_traits = torch.iinfo(quant_dtype)
+        qtype_traits_min = qtype_traits.min
+        qtype_traits_max = qtype_traits.max
+    else:
+        qtype_traits_min, qtype_traits_max = get_fp8_min_max()
     qtype_max = as_float32_tensor(qtype_traits_max)
     s_1 = as_float32_tensor(1.0)
     s_512 = as_float32_tensor(512.0)
@@ -77,17 +70,7 @@ def ref_dynamic_per_token_quant(
 def ref_dynamic_per_tensor_fp8_quant(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    fp8_traits = torch.finfo(FP8_DTYPE)
-    fp8_traits_max = (
-        ROCM_FP8FNUZ_MAX
-        if current_platform.is_rocm() and current_platform.is_fp8_fnuz()
-        else fp8_traits.max
-    )
-    fp8_traits_min = (
-        -ROCM_FP8FNUZ_MAX
-        if current_platform.is_rocm() and current_platform.is_fp8_fnuz()
-        else fp8_traits.min
-    )
+    fp8_traits_min, fp8_traits_max = get_fp8_min_max()
     fp8_max = as_float32_tensor(fp8_traits_max)
     one = as_float32_tensor(1.0)
 
@@ -103,7 +86,7 @@ def ref_dynamic_per_tensor_fp8_quant(
         .clamp(fp8_traits_min, fp8_traits_max)
         .to(FP8_DTYPE)
     )
-    return ref_out, ref_scale.view((1,))
+    return ref_out, ref_scale.view(1)
 
 
 def native_w8a8_block_matmul(
@@ -172,9 +155,7 @@ def native_w8a8_block_matmul(
     return C
 
 
-def native_per_token_group_quant_fp8(
-    x, group_size, eps=1e-10, dtype=torch.float8_e4m3fn
-):
+def native_per_token_group_quant_fp8(x, group_size, eps=1e-10, dtype=FP8_DTYPE):
     """Function to perform per-token-group quantization on an input tensor
     `x` using native torch."""
     assert x.shape[-1] % group_size == 0, (
@@ -182,13 +163,13 @@ def native_per_token_group_quant_fp8(
     )
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    finfo = torch.finfo(dtype)
-    fp8_min = finfo.min
-    fp8_max = finfo.max
+    fp8_min, fp8_max = get_fp8_min_max()
 
     x_ = x.reshape(x.numel() // group_size, group_size)
     amax = x_.abs().max(dim=-1, keepdim=True)[0].clamp(min=eps).to(torch.float32)
     x_s = amax / fp8_max
+    if is_deep_gemm_e8m0_used():
+        x_s = _ceil_to_ue8m0(x_s)
     x_q = (x_ / x_s).clamp(min=fp8_min, max=fp8_max).to(dtype)
     x_q = x_q.reshape(x.shape)
     x_s = x_s.reshape(x.shape[:-1] + (x.shape[-1] // group_size,))
@@ -196,12 +177,15 @@ def native_per_token_group_quant_fp8(
     return x_q, x_s
 
 
-def native_per_token_group_quant_int8(x, group_size, eps=1e-10, dtype=torch.int8):
+def native_per_token_group_quant_int8(
+    x, group_size, eps=1e-10, dtype=torch.int8, *, round_to_nearest=True
+):
     """Function to perform per-token-group quantization on an input tensor
     `x` using native torch.
 
     It converts the tensor values into int8 values and returns the
     quantized tensor along with the scaling factor used for quantization.
+    Per-token quantization rounds to nearest; block quantization truncates.
     """
     assert x.shape[-1] % group_size == 0, (
         "the last dimension of `x` must be divisible by `group_size`"
@@ -216,9 +200,10 @@ def native_per_token_group_quant_int8(x, group_size, eps=1e-10, dtype=torch.int8
     # Use float32 for scale calculation for stability
     amax = x_.abs().max(dim=-1, keepdim=True)[0].clamp(min=eps).to(torch.float32)
     x_s = amax / int8_max
-    x_q = (
-        (x_.to(torch.float32) / x_s).round().clamp(min=int8_min, max=int8_max).to(dtype)
-    )  # Round before clamping
+    x_q = x_.to(torch.float32) / x_s
+    if round_to_nearest:
+        x_q = x_q.round()
+    x_q = x_q.clamp(min=int8_min, max=int8_max).to(dtype)
     x_q = x_q.reshape(x.shape)
     x_s = x_s.reshape(x.shape[:-1] + (x.shape[-1] // group_size,))
 
@@ -262,25 +247,6 @@ def dequant(
             return (t.to(f32) * group_broadcast(scale, t.shape)).to(out_dtype)
     else:
         return t.to(out_dtype)
-
-
-def batched_dequant(
-    t: torch.Tensor,
-    scale: torch.Tensor | None,
-    block_shape: list[int] | None,
-    per_act_token_quant: bool,
-    out_dtype: torch.dtype | None = torch.float32,
-) -> torch.Tensor:
-    if scale is not None:
-        assert t.shape[0] == scale.shape[0]
-        out = torch.empty_like(t, dtype=out_dtype)
-        for e in range(t.shape[0]):
-            out[e] = dequant(
-                t[e], scale[e], block_shape, per_act_token_quant, out_dtype
-            )
-        return out
-
-    return t.to(out_dtype)
 
 
 def native_batched_masked_quant_matmul(

@@ -4,23 +4,24 @@
 import logging
 from pathlib import Path
 
-from vllm import envs
+JSON_FORMAT = (
+    "%(asctime)s %(levelname)s %(name)s %(processName)s %(process)d %(message)s"
+)
 
 
 class NewLineFormatter(logging.Formatter):
     """Adds logging prefix to newlines to align multi-line messages."""
 
-    def __init__(self, fmt, datefmt=None, style="%"):
+    def __init__(self, fmt, datefmt=None, style="%", *, log_level: str | None = None):
         super().__init__(fmt, datefmt, style)
 
-        self.use_relpath = envs.VLLM_LOGGING_LEVEL == "DEBUG"
+        self.use_relpath = log_level == "DEBUG"
         if self.use_relpath:
             self.root_dir = Path(__file__).resolve().parent.parent.parent
 
     def format(self, record):
         def shrink_path(relpath: Path) -> str:
-            """
-            Shortens a file path for logging display:
+            """Shortens a file path for logging display:
             - Removes leading 'vllm' folder if present.
             - If path starts with 'v1',
             keeps the first two and last two levels,
@@ -33,13 +34,13 @@ class NewLineFormatter(logging.Formatter):
             model_executor/.../quantization/utils/fp8_utils.py
             vllm/model_executor/layers/quantization/awq.py ->
             model_executor/layers/quantization/awq.py
-            vllm/v1/attention/backends/mla/common.py ->
-            v1/attention/backends/mla/common.py
 
             Args:
                 relpath (Path): The relative path to be shortened.
+
             Returns:
                 str: The shortened path string for display.
+
             """
             parts = list(relpath.parts)
             new_parts = []
@@ -74,4 +75,63 @@ class NewLineFormatter(logging.Formatter):
         if record.message != "":
             parts = msg.split(record.message)
             msg = msg.replace("\n", "\r\n" + parts[0])
+        return msg
+
+
+class ColoredFormatter(NewLineFormatter):
+    """Adds ANSI color codes to log levels for terminal output.
+
+    This formatter adds colors by injecting them into the format string for
+    static elements (timestamp, filename, line number) and modifying the
+    levelname attribute for dynamic color selection.
+    """
+
+    # ANSI color codes
+    COLORS = {
+        "DEBUG": "\033[37m",  # White
+        "INFO": "\033[32m",  # Green
+        "WARNING": "\033[33m",  # Yellow
+        "ERROR": "\033[31m",  # Red
+        "CRITICAL": "\033[35m",  # Magenta
+    }
+    GREY = "\033[90m"  # Grey for timestamp and file info
+    PROCESS_PREFIX_COLOR = "\033[0;36m"
+    PROCESS_PREFIX_RESET = "\033[0;0m"
+    RESET = "\033[0m"
+
+    def __init__(self, fmt, datefmt=None, style="%", *, log_level: str | None = None):
+        # Inject grey color codes into format string for timestamp and file info
+        if fmt:
+            # Wrap process prefix with cyan
+            fmt = fmt.replace(
+                "(%(vllm_process_name)s pid=%(process)d)",
+                f"{self.PROCESS_PREFIX_COLOR}"
+                "(%(vllm_process_name)s pid=%(process)d)"
+                f"{self.PROCESS_PREFIX_RESET}",
+            )
+            # Wrap %(asctime)s with grey
+            fmt = fmt.replace("%(asctime)s", f"{self.GREY}%(asctime)s{self.RESET}")
+            # Wrap [%(fileinfo)s:%(lineno)d] with grey
+            fmt = fmt.replace(
+                "[%(fileinfo)s:%(lineno)d]",
+                f"{self.GREY}[%(fileinfo)s:%(lineno)d]{self.RESET}",
+            )
+
+        # Call parent __init__ with potentially modified format string
+        super().__init__(fmt, datefmt, style, log_level=log_level)
+
+    def format(self, record):
+        # Store original levelname to restore later (in case record is reused)
+        orig_levelname = record.levelname
+
+        # Only modify levelname - it needs dynamic color based on severity
+        if (color_code := self.COLORS.get(record.levelname)) is not None:
+            record.levelname = f"{color_code}{record.levelname}{self.RESET}"
+
+        # Call parent format which will handle everything else
+        msg = super().format(record)
+
+        # Restore original levelname
+        record.levelname = orig_levelname
+
         return msg

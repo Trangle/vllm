@@ -4,26 +4,26 @@
 import pytest
 import torch
 
-from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
-from vllm.model_executor.custom_op import CustomOp
+from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config import (
+    CompilationConfig,
+    VllmConfig,
+    get_cached_compilation_config,
+    set_current_vllm_config,
+)
+from vllm.model_executor.custom_op import CustomOp, op_registry
 from vllm.model_executor.layers.activation import (
     GeluAndMul,
     ReLUSquaredActivation,
     SiluAndMul,
 )
-from vllm.model_executor.layers.fused_moe.fused_moe import (
-    dispatch_topk_func,
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    dispatch_topk_sigmoid_func,
+    dispatch_topk_softmax_func,
+    vllm_topk_sigmoid,
     vllm_topk_softmax,
 )
-from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-    is_rocm_aiter_moe_enabled,
-)
-from vllm.model_executor.layers.layernorm import (
-    RMSNorm,
-    dispatch_rocm_rmsnorm_func,
-    fused_add_rms_norm,
-    rms_norm,
-)
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.platforms import current_platform
 
 RMS_NORM_SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
@@ -36,7 +36,7 @@ class Relu3(ReLUSquaredActivation):
 
 
 @pytest.mark.parametrize(
-    "env, torch_level, backend, ops_enabled, default_on",
+    "env, compilation_mode, backend, ops_enabled, default_on",
     [
         # Default values based on compile level
         # - All by default (no Inductor compilation)
@@ -77,7 +77,7 @@ class Relu3(ReLUSquaredActivation):
 )
 def test_enabled_ops(
     env: str | None,
-    torch_level: int,
+    compilation_mode: int,
     backend: str,
     ops_enabled: list[int],
     default_on: bool,
@@ -85,26 +85,27 @@ def test_enabled_ops(
     custom_ops = env.split(",") if env else []
     vllm_config = VllmConfig(
         compilation_config=CompilationConfig(
-            backend=backend, level=torch_level, custom_ops=custom_ops
+            backend=backend, mode=compilation_mode, custom_ops=custom_ops
         )
     )
+    get_cached_compilation_config.cache_clear()
     with set_current_vllm_config(vllm_config):
         assert CustomOp.default_on() == default_on
 
         ops_enabled = [bool(x) for x in ops_enabled]
 
         assert RMSNorm(1024).enabled() == ops_enabled[0]
-        assert CustomOp.op_registry["rms_norm"].enabled() == ops_enabled[0]
+        assert op_registry["rms_norm"].enabled() == ops_enabled[0]
 
         assert SiluAndMul().enabled() == ops_enabled[1]
-        assert CustomOp.op_registry["silu_and_mul"].enabled() == ops_enabled[1]
+        assert op_registry["silu_and_mul"].enabled() == ops_enabled[1]
 
         assert GeluAndMul().enabled() == ops_enabled[2]
-        assert CustomOp.op_registry["gelu_and_mul"].enabled() == ops_enabled[2]
+        assert op_registry["gelu_and_mul"].enabled() == ops_enabled[2]
 
         # If registered, subclasses should follow their own name
         assert Relu3().enabled() == ops_enabled[3]
-        assert CustomOp.op_registry["relu3"].enabled() == ops_enabled[3]
+        assert op_registry["relu3"].enabled() == ops_enabled[3]
 
         # Unregistered subclass
         class SiluAndMul2(SiluAndMul):
@@ -126,51 +127,160 @@ def test_enabled_ops_invalid(env: str):
             RMSNorm(1024).enabled()
 
 
-@pytest.mark.parametrize("use_rocm_aiter", ["0", "1"])
-def test_topk_dispatch(use_rocm_aiter: str, monkeypatch):
-    monkeypatch.setenv("VLLM_ROCM_USE_AITER", use_rocm_aiter)
-    topk_func = dispatch_topk_func()
-    is_rocm_aiter_moe_enabled.cache_clear()
-    if current_platform.is_rocm() and int(use_rocm_aiter):
-        from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-            rocm_aiter_topk_softmax,
-        )
+@pytest.mark.parametrize(
+    "use_rocm_aiter", [True, False] if current_platform.is_rocm() else [False]
+)
+def test_topk_softmax_dispatch(use_rocm_aiter: bool):
+    topk_func = dispatch_topk_softmax_func(use_rocm_aiter)
 
-        assert topk_func == rocm_aiter_topk_softmax
+    if current_platform.is_rocm() and use_rocm_aiter:
+        assert topk_func == rocm_aiter_ops.topk_softmax
     else:
         assert topk_func == vllm_topk_softmax
 
 
-@pytest.mark.parametrize("add_residual", [True, False])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("use_rocm_aiter", ["0", "1"])
-@pytest.mark.parametrize("use_rocm_aiter_norm", ["0", "1"])
-@pytest.mark.skipif(
-    not current_platform.is_rocm(), reason="AITER is a feature exclusive for ROCm"
-)
-def test_rms_norm_dispatch(
-    add_residual: bool,
-    dtype: torch.dtype,
-    use_rocm_aiter: str,
-    use_rocm_aiter_norm: str,
-    monkeypatch,
-):
-    monkeypatch.setenv("VLLM_ROCM_USE_AITER", use_rocm_aiter)
-    monkeypatch.setenv("VLLM_ROCM_USE_AITER_RMSNORM", use_rocm_aiter_norm)
-    rms_norm_func = dispatch_rocm_rmsnorm_func(add_residual, dtype)
-
-    should_use_rocm_aiter = (
-        current_platform.is_rocm()
-        and int(use_rocm_aiter)
-        and int(use_rocm_aiter_norm)
-        and dtype in RMS_NORM_SUPPORTED_DTYPES
-    )
-
-    if add_residual and should_use_rocm_aiter:
-        assert rms_norm_func == torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add
-    elif should_use_rocm_aiter:
-        assert rms_norm_func == torch.ops.vllm.rocm_aiter_rms_norm
-    elif add_residual:
-        assert rms_norm_func == fused_add_rms_norm
+def _topk_gating_launch(
+    num_tokens: int = 4,
+    num_experts: int = 512,
+    topk: int = 10,
+    num_shared_experts: int = 0,
+    weights_width: int | None = None,
+    ids_width: int | None = None,
+    contiguous: bool = True,
+) -> dict:
+    """Tensors for one top-k launch, as the topk dispatch functions see them."""
+    width = topk + num_shared_experts
+    weights = torch.empty(num_tokens, weights_width or width)
+    ids = torch.empty(num_tokens, ids_width or width, dtype=torch.int32)
+    ids = ids[:, :topk]
+    if contiguous:
+        gating = torch.empty(num_tokens, num_experts + num_shared_experts)
     else:
-        assert rms_norm_func == rms_norm
+        gating = torch.empty(num_experts + num_shared_experts + 3, num_tokens).t()
+    return dict(topk_weights=weights, topk_indices=ids, gating_output=gating)
+
+
+@pytest.mark.parametrize(
+    "launch, num_shared_experts, scoring_func, expect_gating",
+    [
+        pytest.param({}, 0, "", True, id="plain-softmax"),
+        pytest.param({"num_tokens": 4096}, 0, "", True, id="max-tokens"),
+        pytest.param({"num_tokens": 4097}, 0, "", False, id="too-many-tokens"),
+        pytest.param({"contiguous": False}, 0, "", False, id="non-contiguous"),
+        pytest.param({}, 0, "sigmoid", False, id="scoring-without-shared"),
+        pytest.param({"num_shared_experts": 1}, 1, "sigmoid", True, id="one-shared"),
+        pytest.param({"num_shared_experts": 8}, 8, "sigmoid", True, id="eight-shared"),
+        pytest.param(
+            {"num_shared_experts": 3}, 3, "sigmoid", False, id="unsupported-count"
+        ),
+        pytest.param({"num_shared_experts": 1}, 1, "", False, id="no-shared-scoring"),
+        pytest.param(
+            {"num_shared_experts": 1}, 1, "softmax", False, id="wrong-shared-scoring"
+        ),
+        pytest.param(
+            {"num_shared_experts": 1, "weights_width": 10},
+            1,
+            "sigmoid",
+            False,
+            id="weights-too-narrow",
+        ),
+        pytest.param(
+            {"num_shared_experts": 1, "ids_width": 12},
+            1,
+            "sigmoid",
+            False,
+            id="row-stride-mismatch",
+        ),
+        pytest.param(
+            {"num_tokens": 4097, "num_shared_experts": 1},
+            1,
+            "sigmoid",
+            False,
+            id="shared-too-many-tokens",
+        ),
+    ],
+)
+@pytest.mark.parametrize("gating_enabled", [True, False])
+def test_topk_softmax_dispatch_aiter_topk_gating(
+    monkeypatch: pytest.MonkeyPatch,
+    launch: dict,
+    num_shared_experts: int,
+    scoring_func: str,
+    expect_gating: bool,
+    gating_enabled: bool,
+):
+    """AITER launches use topk_gating only where it is enabled, and only when it
+    supports them.
+
+    Every other AITER launch must reach the legacy topk_softmax, so this is the
+    one place the choice is made.
+    """
+    monkeypatch.setattr(
+        rocm_aiter_ops, "is_topk_gating_enabled", lambda: gating_enabled
+    )
+    topk_func = dispatch_topk_softmax_func(
+        True,
+        **_topk_gating_launch(**launch),
+        num_shared_experts=num_shared_experts,
+        shared_expert_scoring_func=scoring_func,
+    )
+    if expect_gating and gating_enabled:
+        assert topk_func == rocm_aiter_ops.topk_gating
+    else:
+        assert topk_func == rocm_aiter_ops.topk_softmax
+
+
+@pytest.mark.parametrize(
+    "cdna, fused_moe_enabled, expected",
+    [
+        pytest.param(3, True, True, id="cdna3"),
+        pytest.param(4, True, True, id="cdna4"),
+        pytest.param(2, True, False, id="cdna2"),
+        pytest.param(3, False, False, id="cdna3-aiter-moe-off"),
+        pytest.param(4, False, False, id="cdna4-aiter-moe-off"),
+    ],
+)
+def test_topk_gating_enabled_by_cdna(
+    monkeypatch: pytest.MonkeyPatch,
+    cdna: int,
+    fused_moe_enabled: bool,
+    expected: bool,
+):
+    """topk_gating is on for CDNA3 and CDNA4 with AITER MoE enabled, nowhere else."""
+    monkeypatch.setattr("vllm._aiter_ops.is_aiter_found_and_supported", lambda: True)
+    monkeypatch.setattr(
+        rocm_aiter_ops, "is_fused_moe_enabled", lambda: fused_moe_enabled
+    )
+    monkeypatch.setattr("vllm.platforms.rocm.get_cdna_version", lambda: cdna)
+    assert bool(rocm_aiter_ops.is_topk_gating_enabled()) is expected
+
+
+def test_topk_sigmoid_dispatch():
+    topk_func = dispatch_topk_sigmoid_func()
+    assert topk_func == vllm_topk_sigmoid
+
+
+@pytest.mark.parametrize(
+    "launch, expect_gating",
+    [
+        pytest.param({}, True, id="plain-sigmoid"),
+        pytest.param({"num_tokens": 4096}, True, id="max-tokens"),
+        pytest.param({"num_tokens": 4097}, False, id="too-many-tokens"),
+        pytest.param({"contiguous": False}, False, id="non-contiguous"),
+    ],
+)
+@pytest.mark.parametrize("gating_enabled", [True, False])
+def test_topk_sigmoid_dispatch_aiter_topk_gating(
+    monkeypatch: pytest.MonkeyPatch,
+    launch: dict,
+    expect_gating: bool,
+    gating_enabled: bool,
+):
+    monkeypatch.setattr(
+        rocm_aiter_ops, "is_topk_gating_enabled", lambda: gating_enabled
+    )
+    topk_func = dispatch_topk_sigmoid_func(True, **_topk_gating_launch(**launch))
+    if expect_gating and gating_enabled:
+        assert topk_func == rocm_aiter_ops.topk_sigmoid_gating
+    else:
+        assert topk_func == vllm_topk_sigmoid

@@ -1,42 +1,88 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import hashlib
-from typing import Any
+from typing import Literal, get_args
 
-from pydantic.dataclasses import dataclass
+from pydantic import model_validator
+from pydantic_core import ArgsKwargs
 
-from vllm.config.utils import config
+from vllm.config.utils import CompileFactors, config
+from vllm.logger import init_logger
+from vllm.tasks import PoolingTask, check_removed_pooling_task
+
+logger = init_logger(__name__)
+
+SequencePoolingType = Literal["CLS", "LAST", "MEAN"]
+SEQ_POOLING_TYPES: tuple[SequencePoolingType, ...] = get_args(SequencePoolingType)
+
+TokenPoolingType = Literal["ALL", "STEP"]
+TOK_POOLING_TYPES: tuple[TokenPoolingType, ...] = get_args(TokenPoolingType)
+
+POOLER_CONFIG_LOG_FIELDS = (
+    "seq_pooling_type",
+    "tok_pooling_type",
+    "use_activation",
+)
 
 
 @config
-@dataclass
 class PoolerConfig:
     """Controls the behavior of output pooling in pooling models."""
 
-    pooling_type: str | None = None
+    task: PoolingTask | None = None
     """
-    The pooling method of the pooling model. This should be a key in
-    [`vllm.model_executor.layers.pooler.PoolingType`][].
+    The task used for pooling.
     """
 
-    ## for embeddings models
-    normalize: bool | None = None
+    pooling_type: SequencePoolingType | TokenPoolingType | None = None
     """
-    Whether to normalize the embeddings outputs. Defaults to True.
+    The pooling method used for pooling.
+
+    If set, `seq_pooling_type` or `tok_pooling_type` are automatically populated
+    with this field. Alternatively, users can set `seq_pooling_type` and
+    `tok_pooling_type` explicitly.
+
+    This field is mainly for user convenience. Internal code should always use
+    `seq_pooling_type` or `tok_pooling_type` instead of `pooling_type`.
     """
+
+    seq_pooling_type: SequencePoolingType | None = None
+    """
+    The pooling method used for sequence pooling.
+    """
+
+    tok_pooling_type: TokenPoolingType | None = None
+    """
+    The pooling method used for tokenwise pooling.
+    """
+
+    use_activation: bool | None = None
+    """
+    Whether to apply activation function to the pooler outputs.
+    `None` uses the pooler's default, which is `True` in most cases.
+    """
+
+    enable_flash_late_interaction: bool = True
+    """
+    Whether the engine-side late-interaction scorer may use the fused
+    flash-maxsim Triton kernel. Disabled automatically when the API server
+    is started with `--disable-flash-late-interaction`; the reference
+    scorer is used instead.
+    """
+
+    ## for embedding models
     dimensions: int | None = None
     """
     Reduce the dimensions of embeddings if model
     support matryoshka representation. Defaults to None.
     """
-    enable_chunked_processing: bool | None = None
+    enable_chunked_processing: bool = False
     """
     Whether to enable chunked processing for long inputs that exceed the model's
     maximum position embeddings. When enabled, long inputs will be split into
     chunks, processed separately, and then aggregated using weighted averaging.
     This allows embedding models to handle arbitrarily long text without CUDA
-    errors. Defaults to False.
+    errors. Multimodal inputs are not supported. Defaults to False.
     """
     max_embed_len: int | None = None
     """
@@ -47,50 +93,100 @@ class PoolerConfig:
     Defaults to None (i.e. set to max_model_len).
     """
 
-    ## for classification models
-    activation: bool | None = None
+    ## for classification models — affine score calibration
+    logit_mean: float | None = None
     """
-    Whether to apply activation function to the classification outputs.
-    Defaults to True.
+    If provided, subtract this value from classification logits before
+    activation. Used for affine score calibration (Platt scaling):
+    activation((logit - logit_mean) / logit_sigma). Defaults to None.
     """
-    logit_bias: float | None = None
+
+    logit_sigma: float | None = None
     """
-    If provided, apply classification logit biases. Defaults to None.
+    If provided, divide the classification logits by this value after
+    mean subtraction. Used for affine score calibration (Platt scaling):
+    activation((logit - logit_mean) / logit_sigma). Defaults to None.
     """
 
     ## for reward models
-    softmax: bool | None = None
-    """
-    Whether to apply softmax to the reward outputs.
-    Defaults to True.
-    """
     step_tag_id: int | None = None
     """
-    If set, only the score corresponding to the ``step_tag_id`` in the
+    If set, only the score corresponding to the `step_tag_id` in the
     generated sentence should be returned. Otherwise, the scores for all tokens
     are returned.
     """
     returned_token_ids: list[int] | None = None
     """
     A list of indices for the vocabulary dimensions to be extracted,
-    such as the token IDs of ``good_token`` and ``bad_token`` in the
-    ``math-shepherd-mistral-7b-prm`` model.
+    such as the token IDs of `good_token` and `bad_token` in the
+    `math-shepherd-mistral-7b-prm` model.
     """
 
-    def compute_hash(self) -> str:
-        """
-        WARNING: Whenever a new field is added to this config,
-        ensure that it is included in the factors list if
-        it affects the computation graph.
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_parameters(cls, data):
+        values = data.kwargs if isinstance(data, ArgsKwargs) else data
+        if not isinstance(values, dict):
+            return data
+        if "normalize" in values:
+            raise ValueError(
+                "Parameter `normalize` was removed; use `use_activation` instead."
+            )
+        check_removed_pooling_task(values.get("task"))
+        return data
 
-        Provide a hash that uniquely identifies all the configs
-        that affect the structure of the computation
-        graph from input ids/embeddings to the final hidden states,
-        excluding anything before input ids/embeddings and after
-        the final hidden states.
+    def __post_init__(self) -> None:
+        if self.logit_sigma is not None and self.logit_sigma == 0:
+            raise ValueError("logit_sigma cannot be 0 (division by zero)")
+
+        if pooling_type := self.pooling_type:
+            if self.seq_pooling_type is not None:
+                raise ValueError(
+                    "Cannot set both `pooling_type` and `seq_pooling_type`"
+                )
+            if self.tok_pooling_type is not None:
+                raise ValueError(
+                    "Cannot set both `pooling_type` and `tok_pooling_type`"
+                )
+
+            if pooling_type in SEQ_POOLING_TYPES:
+                logger.debug(
+                    "Resolved `pooling_type=%r` to `seq_pooling_type=%r`.",
+                    pooling_type,
+                    pooling_type,
+                )
+                self.seq_pooling_type = pooling_type  # type: ignore[assignment]
+            elif pooling_type in TOK_POOLING_TYPES:
+                logger.debug(
+                    "Resolved `pooling_type=%r` to `tok_pooling_type=%r`.",
+                    pooling_type,
+                    pooling_type,
+                )
+                self.tok_pooling_type = pooling_type  # type: ignore[assignment]
+            else:
+                raise NotImplementedError(pooling_type)
+
+    def get_seq_pooling_type(self) -> SequencePoolingType:
+        if self.seq_pooling_type is None:
+            raise ValueError(
+                "seq_pooling_type is not set; it should be resolved by"
+                " ModelConfig before calling get_seq_pooling_type()"
+            )
+        return self.seq_pooling_type
+
+    def get_tok_pooling_type(self) -> TokenPoolingType:
+        if self.tok_pooling_type is None:
+            raise ValueError(
+                "tok_pooling_type is not set; it should be resolved by"
+                " ModelConfig before calling get_tok_pooling_type()"
+            )
+        return self.tok_pooling_type
+
+    def compile_factors(self) -> CompileFactors:
+        """This config does not affect the compiled graph.
+
+        If a field starts affecting it, return
+        `get_compile_factors(self, ignored_factors)` with every other field in
+        `ignored_factors`.
         """
-        # no factors to consider.
-        # this config will not affect the computation graph.
-        factors: list[Any] = []
-        hash_str = hashlib.md5(str(factors).encode(), usedforsecurity=False).hexdigest()
-        return hash_str
+        return {}

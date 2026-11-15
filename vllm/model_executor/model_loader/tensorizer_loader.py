@@ -21,9 +21,8 @@ from vllm.model_executor.model_loader.tensorizer import (
 )
 from vllm.model_executor.model_loader.utils import (
     get_model_architecture,
-    initialize_model,
-    set_default_torch_dtype,
 )
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
 
@@ -65,26 +64,6 @@ class TensorizerLoader(BaseModelLoader):
         tensorizer_args = self.tensorizer_config._construct_tensorizer_args()
         return tensorizer_weights_iterator(tensorizer_args)
 
-    def _load_model_serialized_cpu(
-        self,
-        vllm_config: VllmConfig,
-    ) -> nn.Module:
-        """Load a serialized model with tensorizer to the CPU.
-
-        This is only necessary when the model isn't vLLM-tensorized (see
-        examples/others/tensorize_vllm_model.py) This should still
-        be faster than default HuggingFace loading, but will be slower than
-        loading a vLLM-tensorized model.
-        """
-        device_config = vllm_config.device_config
-        model_config = vllm_config.model_config
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = initialize_model(vllm_config=vllm_config)
-
-            model.load_weights(self._get_weights_iterator())
-        return model.eval()
-
     def download_model(self, model_config: ModelConfig) -> None:
         self.tensorizer_config.verify_with_model_config(model_config)
 
@@ -103,7 +82,7 @@ class TensorizerLoader(BaseModelLoader):
         """Load serialized model weights with tensorizer.
 
         Expects a vLLM-tensorized model. See the
-        examples/others/tensorize_vllm_model.py example script
+        examples/features/tensorize_vllm_model.py example script
         for serializing vLLM models."""
         if is_vllm_tensorized(self.tensorizer_config):
             tensorizer_config = self._patch_tensorizer_config(model_config)
@@ -112,7 +91,7 @@ class TensorizerLoader(BaseModelLoader):
             model.load_weights(self._get_weights_iterator())
 
     def load_model(
-        self, vllm_config: VllmConfig, model_config: ModelConfig
+        self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
         parallel_config = vllm_config.parallel_config
         self._verify_config(model_config, parallel_config)
@@ -120,6 +99,7 @@ class TensorizerLoader(BaseModelLoader):
         if parallel_config.tensor_parallel_size > 1:
             from vllm.distributed import get_tensor_model_parallel_rank
 
+            assert self.tensorizer_config.tensorizer_uri is not None
             self.tensorizer_config.tensorizer_uri = (
                 self.tensorizer_config.tensorizer_uri % get_tensor_model_parallel_rank()
             )
@@ -134,7 +114,7 @@ class TensorizerLoader(BaseModelLoader):
                     )
             self.load_weights(model, model_config)
             return model
-        return self._load_model_serialized_cpu(vllm_config=vllm_config)
+        return super().load_model(vllm_config, model_config, prefix)
 
     @staticmethod
     def save_model(

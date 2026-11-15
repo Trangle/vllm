@@ -2,9 +2,10 @@
 
 // clang-format will break include orders
 // clang-format off
-#include <torch/all.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/ops.h>
 
-#include <ATen/cuda/CUDAContext.h>
+#include "torch_utils.h"
 
 #include "cutlass/cutlass.h"
 
@@ -18,24 +19,25 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
-#include "core/math.hpp"
+#include "core/utils.hpp"
 #include "cutlass_extensions/common.hpp"
 // clang-format on
 
 namespace vllm::c3x {
 
 static inline cute::Shape<int, int, int, int> get_problem_shape(
-    torch::Tensor const& a, torch::Tensor const& b) {
+    torch::stable::Tensor const& a, torch::stable::Tensor const& b) {
   int32_t m = a.size(0), n = b.size(1), k = a.size(1);
   return {m, n, k, 1};
 }
 
 template <typename GemmKernel>
 void cutlass_gemm_caller(
-    torch::Device device, cute::Shape<int, int, int, int> prob_shape,
+    torch::stable::Device device, cute::Shape<int, int, int, int> prob_shape,
     typename GemmKernel::MainloopArguments mainloop_args,
     typename GemmKernel::EpilogueArguments epilogue_args,
     typename GemmKernel::TileSchedulerArguments scheduler = {}) {
+  const torch::stable::accelerator::DeviceGuard device_guard(device.index());
   cutlass::KernelHardwareInfo hw_info;
   typename GemmKernel::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
                                       prob_shape,
@@ -50,19 +52,20 @@ void cutlass_gemm_caller(
   CUTLASS_CHECK(gemm_op.can_implement(args));
 
   size_t workspace_size = gemm_op.get_workspace_size(args);
-  auto const workspace_options =
-      torch::TensorOptions().dtype(torch::kUInt8).device(device);
-  auto workspace = torch::empty(workspace_size, workspace_options);
+  auto workspace =
+      torch::stable::empty(workspace_size, torch::headeronly::ScalarType::Byte,
+                           std::nullopt, device);
 
-  auto stream = at::cuda::getCurrentCUDAStream(device.index());
+  auto stream = get_current_cuda_stream(device.index());
 
   cutlass::Status status = gemm_op.run(args, workspace.data_ptr(), stream);
   CUTLASS_CHECK(status);
 }
 
 template <typename Gemm, typename... EpilogueArgs>
-void cutlass_gemm_caller(torch::Tensor& out, torch::Tensor const& a,
-                         torch::Tensor const& b,
+void cutlass_gemm_caller(torch::stable::Tensor& out,
+                         torch::stable::Tensor const& a,
+                         torch::stable::Tensor const& b,
                          EpilogueArgs&&... epilogue_params) {
   using ElementAB = typename Gemm::ElementAB;
   using ElementC = typename Gemm::ElementC;

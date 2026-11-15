@@ -2,15 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import math
+
 import numpy
 import torch
 
 import vllm.envs as envs
-from vllm import _custom_ops as ops
+from vllm.distributed.utils import verify_group_size_divides_partition
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+from vllm.utils.math_utils import round_up
+from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .quant_utils import pack_cols, unpack_cols
 
@@ -20,6 +27,7 @@ GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
 GPTQ_MARLIN_MIN_THREAD_K = 128
 GPTQ_MARLIN_MAX_PARALLEL = 16
+MARLIN_MAX_BLOCKS_PER_SM = 4
 
 MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 
@@ -37,14 +45,21 @@ def query_marlin_supported_quant_types(
     include_fp_type: bool = True,
     device_capability: int | None = None,
 ):
-    if device_capability is None:
-        capability_tuple = current_platform.get_device_capability()
-        device_capability = (
-            -1 if capability_tuple is None else capability_tuple.to_int()
-        )
+    if current_platform.is_cpu():
+        return _query_cpu_marlin_supported_quant_types(has_zp, include_fp_type)
 
-    if device_capability < 80:
-        return []
+    if current_platform.is_xpu():
+        return [scalar_types.uint4, scalar_types.uint4b8]
+
+    if not current_platform.is_rocm():
+        if device_capability is None:
+            capability_tuple = current_platform.get_device_capability()
+            device_capability = (
+                -1 if capability_tuple is None else capability_tuple.to_int()
+            )
+
+        if device_capability < 75:
+            return []
 
     # - has_zp is True: return quant_types that has zero points
     # - has_zp is False: return quant_types that has not zero points
@@ -69,6 +84,33 @@ def query_marlin_supported_quant_types(
         return res
 
 
+def _query_cpu_marlin_supported_quant_types(
+    has_zp: bool | None = None,
+    include_fp_type: bool = True,
+):
+    # - has_zp is True: return quant_types that has zero points
+    # - has_zp is False: return quant_types that has not zero points
+    # - has_zp is None: both
+    if has_zp is None:
+        types0 = _query_cpu_marlin_supported_quant_types(
+            False,
+            include_fp_type,
+        )
+        types1 = _query_cpu_marlin_supported_quant_types(
+            True,
+            include_fp_type,
+        )
+        return types0 + types1
+
+    if has_zp:
+        # AWQ style, unsigned + runtime zero-point
+        return [scalar_types.uint4]
+    else:
+        # GPTQ style, unsigned + symmetric bias, only supports 4-bits for now
+        res = [scalar_types.uint4b8]
+        return res
+
+
 def _check_marlin_supported(
     quant_type: ScalarType,
     group_size: int | None,
@@ -88,17 +130,21 @@ def _check_marlin_supported(
     if quant_type not in supported_types:
         return (
             False,
-            f"Marlin does not support weight_bits = {quant_type}. "
-            f"Only types = {supported_types} "
-            f"are supported (for group_size = {group_size}, "
-            f"device_capability = {device_capability}, zp = {has_zp}).",
+            (
+                f"Marlin does not support weight_bits = {quant_type}. "
+                f"Only types = {supported_types} "
+                f"are supported (for group_size = {group_size}, "
+                f"device_capability = {device_capability}, zp = {has_zp})."
+            ),
         )
     if group_size is None or group_size not in MARLIN_SUPPORTED_GROUP_SIZES:
         return (
             False,
-            f"Marlin does not support group_size = {group_size}. "
-            f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
-            "are supported.",
+            (
+                f"Marlin does not support group_size = {group_size}. "
+                f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
+                "are supported."
+            ),
         )
 
     return True, None
@@ -149,12 +195,11 @@ def verify_marlin_supports_shape(
             "with --quantization gptq."
         )
 
-    if group_size < input_size and input_size_per_partition % group_size != 0:
-        raise ValueError(
-            f"Weight input_size_per_partition = {input_size_per_partition}"
-            f" is not divisible by group_size = {group_size}. "
-            "Consider reducing tensor_parallel_size or running "
-            "with --quantization gptq."
+    if group_size < input_size:
+        verify_group_size_divides_partition(
+            input_size_per_partition,
+            group_size,
+            extra_suggestion=" or running with --quantization gptq",
         )
 
 
@@ -173,13 +218,110 @@ def check_marlin_supports_shape(
     return True, None
 
 
-def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
+def marlin_padded_nk(size_n: int, size_k: int, group_size: int = -1) -> tuple[int, int]:
+    """Minimal (padded_n, padded_k) satisfying a Marlin thread-tile family.
+
+    Marlin GEMM and repack require (n % 64, k % 128) or (n % 128, k % 64);
+    shapes satisfying neither are zero-padded up to the cheaper family. K
+    stays divisible by group_size so padded scales keep an integral group
+    count. Padded weight regions contribute nothing to the GEMM output:
+    quantized value 0 decodes to 0.0 (FP4/FP8) or is cancelled by the
+    zero-padded scales/zero-points (INT).
+    """
+    group = group_size if group_size > 0 else 1
+    candidates = (
+        (round_up(size_n, 64), round_up(size_k, math.lcm(128, group))),
+        (round_up(size_n, 128), round_up(size_k, math.lcm(64, group))),
+    )
+    padded_nk = min(candidates, key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]))
+    if padded_nk != (size_n, size_k):
+        logger.warning_once(
+            "Marlin requires thread-tile padding for some weight shapes in "
+            "this model. Activations and/or outputs of the padded layers are "
+            "padded/sliced on every forward; performance may be degraded."
+        )
+    return padded_nk
+
+
+def marlin_repacked_nk(qweight: torch.Tensor, num_bits: int) -> tuple[int, int]:
+    """Recover the (size_n, size_k) a Marlin weight was repacked with
+    (including any tile padding) from its packed shape."""
+    pack_factor = 32 // num_bits
+    size_k = qweight.size(0) * GPTQ_MARLIN_TILE
+    size_n = qweight.size(1) * pack_factor // GPTQ_MARLIN_TILE
+    return size_n, size_k
+
+
+def marlin_pad_qweight(
+    qweight: torch.Tensor, size_n: int, size_k: int, padded_n: int, padded_k: int
+) -> torch.Tensor:
+    """Zero-pad a GPTQ-layout packed weight (size_k / pack, size_n) for
+    gptq_marlin_repack."""
+    if (padded_n, padded_k) == (size_n, size_k):
+        return qweight
+    pack_factor = size_k // qweight.size(0)
+    return torch.nn.functional.pad(
+        qweight, (0, padded_n - size_n, 0, (padded_k - size_k) // pack_factor)
+    )
+
+
+def marlin_pad_scales(
+    scales: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    padded_n: int,
+    padded_k: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Zero-pad weight scales (num_groups, size_n); call before
+    marlin_permute_scales and pass the padded extents to it."""
+    if (padded_n, padded_k) == (size_n, size_k):
+        return scales
+    pad_rows = padded_k // group_size - scales.size(0) if group_size > 0 else 0
+    assert pad_rows >= 0
+    return torch.nn.functional.pad(scales, (0, padded_n - size_n, 0, pad_rows))
+
+
+def marlin_pad_dim(x: torch.Tensor, size: int, padded: int) -> torch.Tensor:
+    """Zero-pad the last dim from size to padded (activations K, bias N)."""
+    if padded == size:
+        return x
+    return torch.nn.functional.pad(x, (0, padded - size))
+
+
+def marlin_unpad_output(
+    output: torch.Tensor, size_n: int, padded_n: int
+) -> torch.Tensor:
+    """Strip padded output columns back to the logical N.
+
+    TODO: marlin_gemm could instead write the un-padded columns directly
+    into a caller-provided `c` buffer so this slice copy disappears.
+    """
+    if padded_n == size_n:
+        return output
+    return output[..., :size_n].contiguous()
+
+
+def check_marlin_supports_layer(
+    layer: LinearBase, group_size: int, allow_tile_padding: bool = False
+) -> bool:
     output_size_per_partition = (
         getattr(layer, "output_size_per_partition", None) or layer.output_size
     )
     input_size_per_partition = (
         getattr(layer, "input_size_per_partition", None) or layer.input_size
     )
+
+    if allow_tile_padding:
+        # Thread-tile misalignment is fixed by zero-padding at weight prep
+        # (see marlin_padded_nk); only a quantization group straddling the
+        # TP shard remains unsupported. Dense layers only - MoE prep does
+        # not pad yet.
+        return (
+            group_size == -1
+            or group_size >= layer.input_size
+            or input_size_per_partition % group_size == 0
+        )
 
     return check_marlin_supports_shape(
         output_size_per_partition=output_size_per_partition,
@@ -189,90 +331,179 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
     )[0]
 
 
-def check_moe_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
-    hidden_size = layer.hidden_size
-    intermediate_size_per_partition = layer.intermediate_size_per_partition
-    # apply_router_weight_on_input is not supported for moe marlin
-    supports_router_weight = not layer.apply_router_weight_on_input
-    # moe marlin requires the activation to be silu
-    supports_activation = layer.activation == "silu"
+def marlin_moe_padded_intermediate(intermediate_size: int, group_size: int = -1) -> int:
+    """Smallest MoE intermediate size satisfying the Marlin MoE thread tiles.
 
-    # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
-    # down: (n, k) = (hidden_size, intermediate_size_per_partition)
-    # moe marlin requires n % 128 == 0 and k % 64 == 0
-    supports_shape = (
-        hidden_size % 128 == 0
-        and intermediate_size_per_partition % max(64, group_size) == 0
-    )
+    The kernel needs gate-up `2 * intermediate % 128 == 0` and down
+    `intermediate % 64 == 0`, i.e. `intermediate % 64 == 0`. A misaligned
+    size is zero-padded to the next valid tile at weight prep, kept a multiple
+    of `group_size` so the group count stays integral. The padded region never
+    reaches the MoE output: w13's padded output channels are zeroed by the
+    zero-padded scales, so the padded inputs to w2 are zero.
+    """
+    group = group_size if group_size > 0 else 1
+    padded = round_up(intermediate_size, math.lcm(64, group))
+    if padded != intermediate_size:
+        logger.warning_once(
+            "Marlin requires thread-tile padding for the MoE intermediate size "
+            "of some layers in this model. Padded experts pad/slice activations "
+            "on every forward; performance may be degraded."
+        )
+    return padded
+
+
+def check_moe_marlin_supports_config(
+    config: FusedMoEConfig,
+    group_size: int,
+    allow_tile_padding: bool = False,
+) -> bool:
+    """Whether the fused MoE Marlin kernel supports `config`.
+
+    With `allow_tile_padding=True`, a tile-misaligned intermediate size is
+    zero-padded to a valid thread tile at weight prep (see
+    marlin_moe_padded_intermediate), so only a group straddling the padded
+    boundary stays unsupported. hidden_size is the MoE I/O extent and is never
+    padded.
+    """
+    if current_platform.is_rocm():
+        return False
+    hidden_size = config.hidden_dim
+    # The layer has not rounded intermediate_size yet; use the stable unpadded
+    # size. gate-up needs n=2*intermediate % 128, down needs k=intermediate % 64.
+    intermediate_size_per_partition = config.intermediate_size_per_partition_unpadded
+    assert intermediate_size_per_partition is not None
+
+    if allow_tile_padding:
+        supports_shape = hidden_size % 128 == 0 and (
+            group_size <= 0 or intermediate_size_per_partition % group_size == 0
+        )
+    else:
+        supports_shape = (
+            hidden_size % 128 == 0
+            and intermediate_size_per_partition % max(64, group_size) == 0
+        )
     supports_group_size = group_size in [-1, 32, 64, 128]
-    return (
-        supports_shape
-        and supports_group_size
-        and supports_router_weight
-        and supports_activation
+    return supports_shape and supports_group_size
+
+
+def check_moe_marlin_supports_layer(
+    layer: RoutedExperts,
+    group_size: int,
+    allow_tile_padding: bool = False,
+) -> bool:
+    return check_moe_marlin_supports_config(
+        layer.moe_config, group_size, allow_tile_padding
     )
 
 
 def marlin_moe_intermediate_size(w1_packed: torch.Tensor, w2_packed: torch.Tensor):
-    """
-    Given Marlin packed weight matrices w1_packed, and w2_packed,
+    """Given Marlin packed weight matrices w1_packed, and w2_packed,
     return the MoE intermediate size N
     """
     marlin_tile_size = 16
     return w2_packed.size(1) * marlin_tile_size
 
 
-def marlin_make_workspace(
-    output_size_per_partition: int, device: torch.device
-) -> torch.Tensor:
-    max_workspace_size = (
-        output_size_per_partition // GPTQ_MARLIN_MIN_THREAD_N
-    ) * GPTQ_MARLIN_MAX_PARALLEL
-
-    return torch.zeros(
-        max_workspace_size, dtype=torch.int, device=device, requires_grad=False
-    )
-
-
 def marlin_make_workspace_new(
-    device: torch.device, max_blocks_per_sm: int = 1
+    device: torch.device,
+    max_blocks_per_sm: int = 1,
 ) -> torch.Tensor:
     # In the new marlin kernel, we use the num of threadblocks as workspace
     # size. The num of threadblocks is sms_count * max_blocks_per_sm.
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
-    return torch.zeros(
-        sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
+    sms = num_compute_units(device.index)
+    return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int, device=device)
+
+
+def get_marlin_workspace(device: torch.device) -> torch.Tensor:
+    """Get zero-initialized locks for the current stream, ubatch, and lane.
+
+    Marlin resets its locks after each call, so ordered calls can reuse them.
+    """
+    from vllm.utils.torch_utils import current_stream
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    if not is_workspace_manager_initialized():
+        return marlin_make_workspace_new(device, MARLIN_MAX_BLOCKS_PER_SM)
+
+    return current_workspace_manager().get_persistent(
+        ("marlin_locks", current_stream()),
+        (num_compute_units(device.index) * MARLIN_MAX_BLOCKS_PER_SM,),
+        torch.int,
+        zero_init=True,
     )
 
 
-def marlin_is_k_full(act_order: bool, is_row_parallel: bool) -> bool:
-    return (not act_order) or (act_order and not is_row_parallel)
+def _marlin_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_bias: torch.Tensor | None,
+    b_scales: torch.Tensor,
+    global_scale: torch.Tensor | None,
+    b_zeros: torch.Tensor | None,
+    workspace: torch.Tensor | None,
+    b_q_type_id: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = False,
+    is_zp_float: bool = False,
+) -> torch.Tensor:
+    if workspace is None:
+        workspace = get_marlin_workspace(a.device)
+    return torch.ops._C.marlin_gemm(
+        a,
+        None,
+        b_q_weight,
+        b_bias,
+        b_scales,
+        global_scale,
+        b_zeros,
+        workspace,
+        b_q_type_id,
+        size_m,
+        size_n,
+        size_k,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    )
 
 
-def marlin_repeat_scales_on_all_ranks(
-    act_order: bool, group_size: int, is_row_parallel: bool
-) -> bool:
-    # Need to repeat scales on every rank if act_ordering or
-    # channelwise and RowParallelLinear
+def _marlin_gemm_fake(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_bias: torch.Tensor | None,
+    b_scales: torch.Tensor,
+    global_scale: torch.Tensor | None,
+    b_zeros: torch.Tensor | None,
+    workspace: torch.Tensor | None,
+    b_q_type_id: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = False,
+    is_zp_float: bool = False,
+) -> torch.Tensor:
+    return torch.empty((size_m, size_n), device=a.device, dtype=a.dtype)
+
+
+direct_register_custom_op("marlin_gemm", _marlin_gemm, fake_impl=_marlin_gemm_fake)
+
+
+def marlin_repeat_scales_on_all_ranks(group_size: int, is_row_parallel: bool) -> bool:
     is_channelwise = group_size == -1
-    return act_order or (is_channelwise and is_row_parallel)
+    return is_channelwise and is_row_parallel
 
 
-def marlin_make_empty_g_idx(device: torch.device) -> torch.Tensor:
+def marlin_make_empty(device: torch.device) -> torch.Tensor:
     return torch.nn.Parameter(
         torch.empty(0, dtype=torch.int, device=device), requires_grad=False
     )
-
-
-def marlin_make_empty_zp(device: torch.device) -> torch.Tensor:
-    return torch.nn.Parameter(
-        torch.empty(0, dtype=torch.int, device=device), requires_grad=False
-    )
-
-
-def marlin_sort_g_idx(g_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    g_idx_sort_indices = torch.argsort(g_idx).to(torch.int)
-    return g_idx[g_idx_sort_indices], g_idx_sort_indices
 
 
 def get_scale_perms():
@@ -306,10 +537,7 @@ def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:
 
 
 def marlin_moe_permute_scales(
-    s: torch.Tensor,
-    size_k: int,
-    size_n: int,
-    group_size: int,
+    s: torch.Tensor, size_k: int, size_n: int, group_size: int
 ):
     num_experts = s.shape[0]
     output = torch.empty(
@@ -337,7 +565,7 @@ def marlin_zero_points(
     elif num_bits == 8:
         interleave = numpy.array([0, 2, 1, 3])
     else:
-        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
+        raise Exception(f"num_bits must be 4 or 8, got {num_bits}")
 
     zp = zp.reshape((-1, len(interleave)))[:, interleave].ravel()
     zp = zp.reshape((-1, size_n)).contiguous()
@@ -347,7 +575,10 @@ def marlin_zero_points(
 
 
 def awq_to_marlin_zero_points(
-    q_zp_packed: torch.Tensor, size_k: int, size_n: int, num_bits: int
+    q_zp_packed: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
 ) -> torch.Tensor:
     # AWQ zero-points are quantized and packed on the column dim.
     # In addition, the values are permuted based on dequantizer.
@@ -361,7 +592,7 @@ def awq_to_marlin_zero_points(
     elif num_bits == 8:
         undo_interleave = numpy.argsort(numpy.array([0, 2, 1, 3]))
     else:
-        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
+        raise Exception(f"num_bits must be 4 or 8, got {num_bits}")
 
     q_zp = q_zp.reshape((-1, len(undo_interleave)))[:, undo_interleave].ravel()
     q_zp = q_zp.reshape((-1, size_n)).contiguous()
@@ -371,7 +602,10 @@ def awq_to_marlin_zero_points(
 
 
 def moe_awq_to_marlin_zero_points(
-    q_zp_packed: torch.Tensor, size_k: int, size_n: int, num_bits: int
+    q_zp_packed: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
 ):
     num_experts = q_zp_packed.shape[0]
     output = torch.empty(
@@ -394,6 +628,29 @@ def maybe_warn_marlin_atomic_add(device, dtype):
             "You can consider change to fp16 to achieve better performance "
             "if possible."
         )
+
+
+def moe_packed_to_marlin_zero_points(
+    q_zp_packed: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+):
+    """Convert compressed-tensors packed zero points to Marlin format.
+
+    Unlike AWQ, compressed-tensors uses standard bit packing without
+    interleaving, so we just unpack and apply Marlin permutation directly.
+    """
+    num_experts = q_zp_packed.shape[0]
+    output = torch.empty(
+        (num_experts, q_zp_packed.shape[1], q_zp_packed.shape[2]),
+        device=q_zp_packed.device,
+        dtype=q_zp_packed.dtype,
+    )
+    for e in range(num_experts):
+        q_zp = unpack_cols(q_zp_packed[e], num_bits, size_k, size_n)
+        output[e] = marlin_zero_points(q_zp, size_k, size_n, num_bits)
+    return output
 
 
 def maybe_warn_marlin_atomic_add_env():
@@ -437,139 +694,43 @@ def apply_gptq_marlin_linear(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     weight_zp: torch.Tensor,
-    g_idx: torch.Tensor,
-    g_idx_sort_indices: torch.Tensor,
-    workspace: torch.Tensor,
+    workspace: torch.Tensor | None,
     wtype: ScalarType,
     output_size_per_partition: int,
     input_size_per_partition: int,
-    is_k_full: bool,
     bias: torch.Tensor | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
 ) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (output_size_per_partition,)
 
+    padded_n, padded_k = marlin_repacked_nk(weight, wtype.size_bits)
+    reshaped_x = marlin_pad_dim(reshaped_x, input_size_per_partition, padded_k)
+
     use_atomic_add = should_use_atomic_add_reduce(
         m=reshaped_x.size(0),
-        n=output_size_per_partition,
-        k=reshaped_x.size(1),
+        n=padded_n,
+        k=padded_k,
         device=input.device,
         dtype=input.dtype,
     )
 
-    output = ops.gptq_marlin_gemm(
+    output = torch.ops.vllm.marlin_gemm(
         reshaped_x,
-        None,
         weight,
         bias,
         weight_scale,
         None,
         weight_zp,
-        g_idx,
-        g_idx_sort_indices,
         workspace,
-        wtype,
+        wtype.id,
         size_m=reshaped_x.shape[0],
-        size_n=output_size_per_partition,
-        size_k=input_size_per_partition,
-        is_k_full=is_k_full,
+        size_n=padded_n,
+        size_k=padded_k,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=use_fp32_reduce,
         is_zp_float=False,
     )
 
-    return output.reshape(out_shape)
-
-
-def apply_awq_marlin_linear(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_zp: torch.Tensor,
-    g_idx: torch.Tensor,
-    g_idx_sort_indices: torch.Tensor,
-    workspace: torch.Tensor,
-    quant_type: ScalarType,
-    output_size_per_partition: int,
-    input_size_per_partition: int,
-    bias: torch.Tensor | None = None,
-    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
-) -> torch.Tensor:
-    reshaped_x = input.reshape(-1, input.shape[-1])
-    out_shape = input.shape[:-1] + (output_size_per_partition,)
-
-    use_atomic_add = should_use_atomic_add_reduce(
-        m=reshaped_x.size(0),
-        n=output_size_per_partition,
-        k=reshaped_x.size(1),
-        device=input.device,
-        dtype=input.dtype,
-    )
-
-    output = ops.gptq_marlin_gemm(
-        reshaped_x,
-        None,
-        weight,
-        bias,
-        weight_scale,
-        None,
-        weight_zp,
-        g_idx,
-        g_idx_sort_indices,
-        workspace,
-        quant_type,
-        size_m=reshaped_x.shape[0],
-        size_n=output_size_per_partition,
-        size_k=input_size_per_partition,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=use_fp32_reduce,
-        is_zp_float=False,
-    )
-
-    return output.reshape(out_shape)
-
-
-def apply_rtn_marlin_linear(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    quant_type: ScalarType,
-    output_size_per_partition: int,
-    input_size_per_partition: int,
-    bias: torch.Tensor | None = None,
-    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
-) -> torch.Tensor:
-    reshaped_x = input.reshape(-1, input.shape[-1])
-    out_shape = input.shape[:-1] + (output_size_per_partition,)
-
-    use_atomic_add = should_use_atomic_add_reduce(
-        m=reshaped_x.size(0),
-        n=output_size_per_partition,
-        k=reshaped_x.size(1),
-        device=input.device,
-        dtype=input.dtype,
-    )
-
-    output = ops.gptq_marlin_gemm(
-        reshaped_x,
-        None,
-        weight,
-        bias,
-        weight_scale,
-        None,
-        None,
-        None,
-        None,
-        workspace,
-        quant_type,
-        size_m=reshaped_x.shape[0],
-        size_n=output_size_per_partition,
-        size_k=input_size_per_partition,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=use_fp32_reduce,
-        is_zp_float=False,
-    )
-
+    output = marlin_unpad_output(output, output_size_per_partition, padded_n)
     return output.reshape(out_shape)

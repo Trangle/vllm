@@ -1,6 +1,8 @@
 #pragma once
 
-#include "cuda_utils.h"
+#include <torch/headeronly/util/shim_utils.h>
+
+#include "core/utils.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
 
@@ -123,17 +125,17 @@ struct cutlass_3x_gemm_fp8_blockwise {
           MainloopScheduler
       >::CollectiveOp>;
 
-  using KernelType = enable_sm100_only<cutlass::gemm::kernel::GemmUniversal<
+  using KernelType = enable_sm100_to_sm120<cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>>;
 
   struct GemmKernel : public KernelType {};
 };
 
 template <typename Gemm>
-void cutlass_gemm_caller_blockwise(torch::Tensor& out, torch::Tensor const& a,
-                                   torch::Tensor const& b,
-                                   torch::Tensor const& a_scales,
-                                   torch::Tensor const& b_scales) {
+void cutlass_gemm_caller_blockwise(torch::stable::Tensor& out, torch::stable::Tensor const& a,
+                                   torch::stable::Tensor const& b,
+                                   torch::stable::Tensor const& a_scales,
+                                   torch::stable::Tensor const& b_scales) {
   static constexpr bool swap_ab = Gemm::swap_ab;
   using GemmKernel = typename Gemm::GemmKernel;
   using StrideA = typename Gemm::GemmKernel::StrideA;
@@ -150,6 +152,29 @@ void cutlass_gemm_caller_blockwise(torch::Tensor& out, torch::Tensor const& a,
 
   int32_t m = a.size(0), n = b.size(1), k = a.size(1);
 
+  // The SM100 blockwise SF copy requires the SFA M extent to be a multiple
+  // of 4 (4-row copy atom). For misaligned M on the non-swapAB path, pad only
+  // the per-token activation scales (column-major (m, k/128), 1/64 the size
+  // of the bf16 activation) and build layout_SFA from the padded extent.
+  int32_t m_sf = m;
+  std::optional<torch::stable::Tensor> a_scales_pad;
+  void const* a_scales_data = a_scales.data_ptr();
+  if constexpr (!swap_ab) {
+    if (m % 4 != 0) {
+      m_sf = (m + 3) & ~3;
+      int64_t num_groups = a_scales.numel() / m;
+      a_scales_pad = torch::stable::new_empty(
+          a_scales, {num_groups * m_sf},
+          torch::headeronly::ScalarType::Float);
+      cudaMemcpy2DAsync(a_scales_pad->data_ptr(), m_sf * sizeof(float),
+                        a_scales.data_ptr(), m * sizeof(float),
+                        m * sizeof(float), num_groups,
+                        cudaMemcpyDeviceToDevice,
+                        get_current_cuda_stream(a.get_device()));
+      a_scales_data = a_scales_pad->data_ptr();
+    }
+  }
+
   StrideA a_stride;
   StrideB b_stride;
   StrideC c_stride;
@@ -160,16 +185,16 @@ void cutlass_gemm_caller_blockwise(torch::Tensor& out, torch::Tensor const& a,
   c_stride =
       cutlass::make_cute_packed_stride(StrideC{}, swap_ab ? cute::make_shape(n, m, 1) : cute::make_shape(m, n, 1));
 
-  LayoutSFA layout_SFA = swap_ab ? 
+  LayoutSFA layout_SFA = swap_ab ?
       ScaleConfig::tile_atom_to_shape_SFA(make_shape(n, m, k, 1)) :
-      ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+      ScaleConfig::tile_atom_to_shape_SFA(make_shape(m_sf, n, k, 1));
   LayoutSFB layout_SFB = swap_ab ?
       ScaleConfig::tile_atom_to_shape_SFB(make_shape(n, m, k, 1)) :
       ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 
   auto a_ptr = static_cast<ElementAB const*>(a.data_ptr());
   auto b_ptr = static_cast<ElementAB const*>(b.data_ptr());
-  auto a_scales_ptr = static_cast<ElementBlockScale const*>(a_scales.data_ptr());
+  auto a_scales_ptr = static_cast<ElementBlockScale const*>(a_scales_data);
   auto b_scales_ptr = static_cast<ElementBlockScale const*>(b_scales.data_ptr());
 
   typename GemmKernel::MainloopArguments mainloop_args{};
@@ -200,25 +225,27 @@ void cutlass_gemm_caller_blockwise(torch::Tensor& out, torch::Tensor const& a,
 }
 
 template <typename OutType>
-void cutlass_gemm_blockwise_sm100_fp8_dispatch(torch::Tensor& out,
-                                               torch::Tensor const& a,
-                                               torch::Tensor const& b,
-                                               torch::Tensor const& a_scales,
-                                               torch::Tensor const& b_scales) {
+void cutlass_gemm_blockwise_sm100_fp8_dispatch(torch::stable::Tensor& out,
+                                               torch::stable::Tensor const& a,
+                                               torch::stable::Tensor const& b,
+                                               torch::stable::Tensor const& a_scales,
+                                               torch::stable::Tensor const& b_scales) {
   int32_t m = a.size(0), n = b.size(1), k = a.size(1), sms;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, a.get_device());
 
   constexpr int TILE_K = 128;
   // TODO: better heuristics
-  bool swap_ab = (m < 16) || (m % 4 != 0);
+  // swapAB only wins for small M; misaligned M >= 65 is faster on the
+  // non-swapAB path with padded activation scales (measured on GB300).
+  bool swap_ab = (m <= 64);
   bool use_tma_epilogue = (m * n) % 4 == 0;
   if (!swap_ab) {
     constexpr int TILE_N = 128;
     int tile_m = 256;
-    if (cuda_utils::ceil_div(n, TILE_N) * cuda_utils::ceil_div(m, 64) <= sms) {
+    if (div_ceil(n, TILE_N) * div_ceil(m, 64) <= sms) {
       tile_m = 64;
     }
-    else if (cuda_utils::ceil_div(n, TILE_N) * cuda_utils::ceil_div(m, 128) <= sms) {
+    else if (div_ceil(n, TILE_N) * div_ceil(m, 128) <= sms) {
       tile_m = 128;
     }
     if (tile_m == 64) {

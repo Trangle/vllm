@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from collections.abc import Generator
+from contextlib import contextmanager
 from weakref import WeakValueDictionary
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class Cache:
@@ -29,8 +35,9 @@ class All2AllManagerBase:
     rank: int
     world_size: int
 
-    def __init__(self, cpu_group):
+    def __init__(self, cpu_group, tcp_store_group=None):
         self.cpu_group = cpu_group
+        self.tcp_store_group = tcp_store_group
 
         # compute some common properties
         from vllm.distributed.parallel_state import (
@@ -47,12 +54,19 @@ class All2AllManagerBase:
         # when we create this object
         self.dp_rank = self.dp_group.rank_in_group
         self.dp_world_size = self.dp_group.world_size
-        self.rank = dist.get_rank(cpu_group)
-        self.world_size = dist.get_world_size(cpu_group)
+        self.rank = cpu_group.rank()
+        self.world_size = cpu_group.size()
 
         # all2all communication often has separate implementations for
         # intra-node and inter-node communication
-        self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))
+        if tcp_store_group is None:
+            self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))
+        else:
+            self.internode = not all(
+                in_the_same_node_as(tcp_store_group, source_rank=0)
+            )
+
+        self.support_fault_tolerance = False
 
     def get_handle(self, kwargs):
         # get a handle for the all2all communication,
@@ -63,12 +77,67 @@ class All2AllManagerBase:
         # and reuse it for the same config.
         raise NotImplementedError
 
-    def dispatch(
+    def dispatch_router_logits(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
+        # Subclasses should either:
+        # - implement handling for extra_tensors, or
+        # - raise a clear error if extra_tensors is not supported.
+        raise NotImplementedError
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        # Subclasses should either:
+        # - implement handling for extra_tensors, or
+        # - raise a clear error if extra_tensors is not supported.
+        raise NotImplementedError
+
+    def query_active_mask(self) -> torch.Tensor:
+        """Return the all2all liveness mask for the EP ranks.
+
+        Returns:
+            An int32 device tensor where 0 marks a live rank and 1 marks a
+            masked (dead/unreachable) rank.
+
+        """
+        raise NotImplementedError
+
+    def query_fault(self) -> torch.Tensor:
+        """Return a scalar bool tensor, True if a new fault appeared.
+
+        Compares the current mask against the baseline recorded at the last
+        recovery point.
+        """
+        raise NotImplementedError
+
+    def clean_buffers(self) -> None:
+        """Reset this rank's RDMA buffers and all2all mask state (rank-local).
+
+        Post-fault cleanup: a dispatch/combine that hit a dead peer or timed
+        out can leave partially-written or stale tokens in the RDMA receive
+        buffer, so it is zeroed to stop the next forward from reading that
+        contaminated data.
+        """
+        raise NotImplementedError
+
+    def update_mask(self, rank: int, masked: bool = True) -> None:
+        """Set the mask for a specific EP rank. Used during scale-down."""
         raise NotImplementedError
 
     def set_num_sms(self, num_sms: int):
@@ -77,16 +146,55 @@ class All2AllManagerBase:
     def max_sms_used(self) -> int | None:
         return None  # None means it could use the whole GPU
 
+    def checkpoint_prepare(self) -> None:
+        logger.warning_once(
+            "%s.checkpoint_prepare is not implemented; skipping.",
+            type(self).__name__,
+        )
+
+    def checkpoint_restore(self) -> None:
+        logger.warning_once(
+            "%s.checkpoint_restore is not implemented; skipping.",
+            type(self).__name__,
+        )
+
     def combine(self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False):
         raise NotImplementedError
+
+    def allocate_combine_input(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        is_sequence_parallel: bool = False,
+    ) -> torch.Tensor | None:
+        return None
+
+    def combine_into_output(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        is_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        output.copy_(self.combine(hidden_states, is_sequence_parallel))
+        return output
 
     def destroy(self):
         pass
 
+    def stage_ep_size(self) -> None:
+        pass
+
+    def commit_ep_size(self) -> None:
+        pass
+
+    @contextmanager
+    def mask_remote_ranks(self) -> Generator[None]:
+        yield
+
 
 class DeviceCommunicatorBase:
-    """
-    Base class for device-specific communicator.
+    """Base class for device-specific communicator.
     It can use the `cpu_group` to initialize the communicator.
     If the device has PyTorch integration (PyTorch can recognize its
     communication backend), the `device_group` will also be given.
@@ -98,38 +206,65 @@ class DeviceCommunicatorBase:
         device: torch.device | None = None,
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
+        global_ranks: list[int] | None = None,
+        global_world_size: int | None = None,
+        use_all2all: bool = False,
     ):
         self.device = device or torch.device("cpu")
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.unique_name = unique_name
-        self.rank = dist.get_rank(cpu_group)
-        self.world_size = dist.get_world_size(cpu_group)
-        self.ranks = dist.get_process_group_ranks(cpu_group)
-        self.global_rank = dist.get_rank()
-        self.global_world_size = dist.get_world_size()
-        self.rank_in_group = dist.get_group_rank(self.cpu_group, self.global_rank)
 
-        use_ep = False
+        # Check if this is a stateless process group
+        from torch.distributed.distributed_c10d import _world
+
+        is_stateless = _world.pg_map.get(cpu_group, None) is None
+
+        if is_stateless:
+            # For stateless groups, we can't use torch.distributed methods
+            self.rank = cpu_group.rank()
+            self.world_size = cpu_group.size()
+            assert global_ranks is not None
+            assert global_world_size is not None
+            self.ranks = global_ranks
+            self.global_rank = self.ranks[self.rank]
+            self.global_world_size = global_world_size
+            self.rank_in_group = self.rank
+        else:
+            self.rank = dist.get_rank(cpu_group)
+            self.world_size = dist.get_world_size(cpu_group)
+            self.ranks = dist.get_process_group_ranks(cpu_group)
+            self.global_rank = dist.get_rank()
+            self.global_world_size = dist.get_world_size()
+            self.rank_in_group = dist.get_group_rank(self.cpu_group, self.global_rank)
+
         all2all_backend = None
-        from vllm.config import get_current_vllm_config
+        from vllm.config import get_current_vllm_config_or_none
 
-        config = get_current_vllm_config()
+        config = get_current_vllm_config_or_none()
         if config is not None:
-            # as long as we use data parallel (coupled data parallel
-            # where all data parallel ranks execute forward together),
-            # we initialize the all2all manager used in expert parallel.
-            use_ep = config.parallel_config.data_parallel_size > 1
             all2all_backend = config.parallel_config.all2all_backend
 
-        self.is_ep_communicator = "ep" in unique_name
-        self.use_all2all = self.is_ep_communicator and use_ep
+        self.is_ep_communicator = unique_name.split(":")[0] == "ep"
+        self.use_all2all = self.is_ep_communicator and use_all2all
         self.all2all_backend = all2all_backend
         self.all2all_manager: All2AllManagerBase | None = None
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(input_, group=self.device_group)
         return input_
+
+    def checkpoint_prepare(self) -> None:
+        """Prepare reclaimable communicator state for checkpoint (default: no-op)."""
+
+    def checkpoint_restore(self) -> None:
+        """Restore communicator state after checkpoint (default: no-op)."""
+
+    def suspend(self) -> None:
+        """Release reclaimable communicator memory (default: no-op)."""
+
+    def resume(self) -> None:
+        """Restore memory released by `suspend` (default: no-op)."""
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
@@ -202,11 +337,56 @@ class DeviceCommunicatorBase:
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def reduce_scatterv_into_output(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        output.copy_(self.reduce_scatterv(input_, dim, sizes))
+        return output
+
+    def get_symmetric_memory_buffer(
+        self,
+        role: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        return None
+
+    def all_to_all_single(
+        self,
+        input_: torch.Tensor,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        """All-to-all over dim 0, split evenly across ranks if sizes are None."""
+        if self.world_size == 1:
+            return input_
+        input_ = input_.contiguous()
+        if output_split_sizes is None:
+            output = torch.empty_like(input_)
+        else:
+            output = torch.empty(
+                (sum(output_split_sizes), *tuple(input_.shape[1:])),
+                dtype=input_.dtype,
+                device=input_.device,
+            )
+        torch.distributed.all_to_all_single(
+            output,
+            input_,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=self.device_group,
+        )
+        return output
+
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
     ) -> torch.Tensor | None:
-        """
-        NOTE: We assume that the input tensor is on the same device across
+        """NOTE: We assume that the input tensor is on the same device across
         all the ranks.
         NOTE: `dst` is the local rank of the destination rank.
         """
@@ -234,7 +414,7 @@ class DeviceCommunicatorBase:
         return output_tensor
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
-        """Sends a tensor to the destination rank in a blocking way"""
+        """Sends a tensor to the destination rank in a blocking way."""
         """NOTE: `dst` is the local rank of the destination rank."""
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
@@ -252,46 +432,76 @@ class DeviceCommunicatorBase:
         torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+        """Broadcast a tensor from source rank to all ranks."""
+        if self.world_size == 1:
+            return tensor
+        torch.distributed.broadcast(tensor, self.ranks[src], self.device_group)
+        return tensor
+
     def destroy(self):
         pass
 
-    def prepare_communication_buffer_for_model(self, model: torch.nn.Module) -> None:
-        """
-        Prepare the communication buffer for the model.
-        """
-        if not self.is_ep_communicator:
-            return
-
-        moe_modules = [
-            module
-            for module in model.modules()
-            # TODO(bnell): Should use isinstance but can't.  Maybe search for
-            # presence of quant_method.init_prepare_finalize?
-            if (
-                module.__class__.__name__ == "FusedMoE"
-                or module.__class__.__name__ == "SharedFusedMoE"
-            )
-        ]
-        for module in moe_modules:
-            module.quant_method.init_prepare_finalize(module)
-
-    def dispatch(
+    def dispatch_router_logits(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Dispatch the hidden states and router logits to the appropriate device.
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        """Dispatch the hidden states and router logits to the appropriate device.
         This is a no-op in the base class.
         """
+        if extra_tensors is not None:
+            return hidden_states, router_logits, extra_tensors
         return hidden_states, router_logits
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        """Dispatch the hidden states and topk weights/ids to the appropriate device.
+        This is a no-op in the base class.
+        """
+        if extra_tensors is not None:
+            return hidden_states, topk_weights, topk_ids, extra_tensors
+        return hidden_states, topk_weights, topk_ids
 
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
-        """
-        Combine the hidden states and router logits from the appropriate device.
+        """Combine the hidden states and router logits from the appropriate device.
         This is a no-op in the base class.
         """
         return hidden_states
+
+    def allocate_combine_input(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        is_sequence_parallel: bool = False,
+    ) -> torch.Tensor | None:
+        return None
+
+    def combine_into_output(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        is_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        output.copy_(self.combine(hidden_states, is_sequence_parallel))
+        return output
+
+    def batch_isend_irecv(self, p2p_ops: list):
+        raise NotImplementedError

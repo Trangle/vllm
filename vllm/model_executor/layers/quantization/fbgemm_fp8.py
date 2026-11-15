@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.nn import Module
-from torch.nn.parameter import Parameter
 
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear import (
+    init_fp8_linear_kernel,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -19,22 +22,21 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-    apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    GroupShape,
     is_layer_skipped,
+    kFp8DynamicTokenSym,
+    kFp8StaticTokenSym,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    Fp8LinearOp,
-    maybe_create_device_identity,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -76,7 +78,7 @@ class FBGEMMFp8Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> "QuantizeMethodBase | None":
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
                 prefix=prefix,
@@ -91,10 +93,8 @@ class FBGEMMFp8Config(QuantizationConfig):
 class FBGEMMFp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: FBGEMMFp8Config):
         self.quant_config = quant_config
-        self.fp8_linear = Fp8LinearOp(
-            act_quant_static=False, act_quant_group_shape=GroupShape.PER_TOKEN
-        )
         self.out_dtype = torch.get_default_dtype()
+        self.input_dtype = get_current_vllm_config().model_config.dtype
 
     def create_weights(
         self,
@@ -106,7 +106,6 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        maybe_create_device_identity()
         weight_loader = extra_weight_attrs.get("weight_loader")
         del input_size, output_size
         output_size_per_partition = sum(output_partition_sizes)
@@ -146,11 +145,16 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
         )
         layer.input_scale_ub = input_scale_ub
 
-    def process_weights_after_loading(self, layer: Module) -> None:
-        # required by torch.compile
-        layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
-        layer.weight = Parameter(layer.weight.data, requires_grad=False)
+        self.fp8_linear = init_fp8_linear_kernel(
+            activation_quant_key=kFp8DynamicTokenSym,
+            weight_quant_key=kFp8StaticTokenSym,
+            weight_shape=layer.weight.shape,
+            input_dtype=self.input_dtype,
+            out_dtype=self.out_dtype,
+            module_name=self.__class__.__name__,
+        )
 
+    def process_weights_after_loading(self, layer: Module) -> None:
         weight = layer.weight
 
         if current_platform.is_fp8_fnuz():
@@ -158,14 +162,17 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 weight=weight, weight_scale=layer.weight_scale, input_scale=None
             )
             if input_scale is not None:
-                layer.input_scale = Parameter(input_scale, requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                replace_parameter(layer, "input_scale", input_scale)
+            replace_parameter(layer, "weight_scale", weight_scale)
 
-        layer.weight = Parameter(weight.t(), requires_grad=False)
+        replace_parameter(layer, "weight", weight.t())
+        # The param keeps its checkpoint dims; Humming reads the (K, N) layout.
+        layer.processed_weight_dims = (0, 1)
         if self.quant_config.use_marlin:
+            # Activations are not quantized for marlin (input_scale_ub unused).
             prepare_fp8_layer_for_marlin(layer)
-            # Activations not quantized for marlin.
-            del layer.input_scale_ub
+
+        self.fp8_linear.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -173,23 +180,4 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.quant_config.use_marlin:
-            return apply_fp8_marlin_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                workspace=layer.workspace,
-                size_n=layer.output_size_per_partition,
-                size_k=layer.input_size_per_partition,
-                bias=bias,
-            )
-
-        return self.fp8_linear.apply(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            out_dtype=self.out_dtype,
-            input_scale=None,
-            input_scale_ub=layer.input_scale_ub,
-            bias=bias,
-        )
+        return self.fp8_linear.apply_weights(layer, x, bias)

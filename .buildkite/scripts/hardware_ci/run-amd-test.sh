@@ -1,231 +1,208 @@
 #!/bin/bash
-
-# This script runs test inside the corresponding ROCm docker container.
+# Run one AMD CI job in its Kubernetes pod.
+#
+# The container image ($ROCM_CI_REPO:build-<build-id>) already contains vLLM,
+# all test dependencies, and /vllm-workspace. This script:
+#   1. Sets up per-job local caches and validates the HF mount.
+#   2. Fetches this build's wheel artifact for python_only_compile.sh.
+#   3. Acquires the DPX GPU partition lock when running on a DPX agent.
+#   4. Runs a preflight check (imports + GPU count).
+#   5. Executes $VLLM_TEST_COMMANDS under a wall-clock timeout.
+#   6. Writes a diagnostics bundle on failure.
 set -o pipefail
 
-# Export Python path
-export PYTHONPATH=".."
+# ---------------------------------------------------------------------------
+# Inputs — set by the pipeline / ci-infra template
+# ---------------------------------------------------------------------------
+commands=${VLLM_TEST_COMMANDS:?VLLM_TEST_COMMANDS must be set by the pipeline}
+gpus=${VLLM_CI_EXPECTED_GPU_COUNT:-1}
+[[ $gpus =~ ^(0|[1-9][0-9]*)$ ]] || { echo "Invalid VLLM_CI_EXPECTED_GPU_COUNT=$gpus" >&2; exit 1; }
+job=${BUILDKITE_JOB_ID:-local}
+job=${job//[^A-Za-z0-9_.-]/_}
+# Short: Ray puts AF_UNIX sockets under $TMPDIR, whose paths may not exceed 107 bytes.
+root=/tmp/vllm-${job##*-}
+root=${root:0:22}
 
-# Print ROCm version
-echo "--- Confirming Clean Initial State"
-while true; do
-        sleep 3
-        if grep -q clean /opt/amdgpu/etc/gpu_state; then
-                echo "GPUs state is \"clean\""
-                break
-        fi
-done
+# ---------------------------------------------------------------------------
+# Cache directories — all under $root so they are job-local and isolated.
+# HF hub is the one exception: it lives on the node's persistent NFS mount.
+# ---------------------------------------------------------------------------
+export HF_HOME=${HF_HOME:-/home/buildkite-agent/huggingface}
+export TIKTOKEN_RS_CACHE_DIR=$HF_HOME/tiktoken-rs-cache
+export PYTHONPATH=/vllm-workspace
+export PYTORCH_ROCM_ARCH=""                        # let vLLM detect arches at runtime
+export TMPDIR=$root/tmp
+export VLLM_RPC_BASE_PATH=/tmp
+export TORCHINDUCTOR_CACHE_DIR=$root/inductor
+export TRITON_CACHE_DIR=$root/triton
+export VLLM_CACHE_ROOT=$root/vllm
+export XDG_CACHE_HOME=$root/xdg
+export HF_DATASETS_CACHE=$root/datasets
+export HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT:-300}
+export HF_HUB_ETAG_TIMEOUT=${HF_HUB_ETAG_TIMEOUT:-60}
 
-echo "--- ROCm info"
-rocminfo
+mkdir -p \
+  "$TMPDIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" \
+  "$VLLM_CACHE_ROOT" "$XDG_CACHE_HOME" "$HF_DATASETS_CACHE" \
+  "$TIKTOKEN_RS_CACHE_DIR" || exit 1
 
-# cleanup older docker images
-cleanup_docker() {
-  # Get Docker's root directory
-  docker_root=$(docker info -f '{{.DockerRootDir}}')
-  if [ -z "$docker_root" ]; then
-    echo "Failed to determine Docker root directory."
-    exit 1
-  fi
-  echo "Docker root directory: $docker_root"
-  # Check disk usage of the filesystem where Docker's root directory is located
-  disk_usage=$(df "$docker_root" | tail -1 | awk '{print $5}' | sed 's/%//')
-  # Define the threshold
-  threshold=70
-  if [ "$disk_usage" -gt "$threshold" ]; then
-    echo "Disk usage is above $threshold%. Cleaning up Docker images and volumes..."
-    # Remove dangling images (those that are not tagged and not used by any container)
-    docker image prune -f
-    # Remove unused volumes / force the system prune for old images as well.
-    docker volume prune -f && docker system prune --force --filter "until=72h" --all
-    echo "Docker images and volumes cleanup completed."
-  else
-    echo "Disk usage is below $threshold%. No cleanup needed."
-  fi
+# HF_HOME must be a persistent mount, not rootfs (catches misconfigured nodes).
+[[ $(findmnt -n -T "$HF_HOME" -o TARGET) != / ]] \
+  || { echo "HF_HOME is on rootfs — it must be a persistent node mount" >&2; exit 1; }
+
+# hf-xet state corrupts on NFS; redirect it to a local tmpdir when needed.
+if [[ $(findmnt -n -T "$HF_HOME" -o FSTYPE) == nfs* ]]; then
+  export HF_XET_CACHE=$root/hf-xet
+  export HF_XET_HIGH_PERFORMANCE=0
+  export HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE=0
+fi
+
+# ---------------------------------------------------------------------------
+# Terminal and pytest settings
+# ---------------------------------------------------------------------------
+# Keep CI log output colorized.
+: "${TERM:=xterm-256color}" "${FORCE_COLOR:=1}" "${CLICOLOR_FORCE:=1}" "${PY_COLORS:=1}"
+export TERM FORCE_COLOR CLICOLOR_FORCE PY_COLORS
+
+# Fault-handler dumps stacks after 25 min; pytest-timeout kills a single test
+# after 40 min (PYTEST_TIMEOUT=2400 s). Both are overridable by the pipeline.
+export PYTHONFAULTHANDLER=1
+export PYTEST_TIMEOUT=${PYTEST_TIMEOUT:-2400}
+export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} \
+  --color=yes \
+  --durations=25 \
+  --durations-min=1.0 \
+  -o faulthandler_timeout=1500 \
+  --timeout-method=thread"
+
+# After its summary, a pytest process leaves without native library teardown, where it
+# has crashed with SIGSEGV after every test passed (amd_ci_fast_exit.py, which the test image
+# installs into site-packages so that commands setting their own PYTHONPATH still find it).
+export PYTEST_ADDOPTS="$PYTEST_ADDOPTS -p amd_ci_fast_exit"
+
+[[ $gpus == 0 ]] && export VLLM_TARGET_DEVICE=cpu
+
+# ---------------------------------------------------------------------------
+# Wheel reinstall — python_only_compile.sh path
+# ---------------------------------------------------------------------------
+# python_only_compile.sh reinstalls vLLM around this build's wheel, which build.sh uploads as an
+# artifact of the image build step (kept out of the image: only this test needs it).
+if [[ $commands == *python_only_compile.sh* ]]; then
+  wheel_dir=$(mktemp -d)
+  for try in 1 2 3; do
+    buildkite-agent artifact download ".rocm-wheel/vllm-*.whl" "$wheel_dir" --step image-build-amd \
+      && break
+    ((try == 3)) && exit 1
+    sleep $((try * 5))
+  done
+  wheels=("$wheel_dir"/.rocm-wheel/vllm-*.whl)
+  [[ ${#wheels[@]} == 1 && -f ${wheels[0]} ]] \
+    || { echo "Expected exactly one wheel artifact, found: ${wheels[*]}" >&2; exit 1; }
+  VLLM_PRECOMPILED_WHEEL_LOCATION=${wheels[0]}
+  VLLM_VERSION_OVERRIDE=$(python3 -P -c \
+    'import importlib.metadata as m; print(m.version("vllm"))') || exit 1
+  export VLLM_TARGET_DEVICE=rocm VLLM_VERSION_OVERRIDE VLLM_PRECOMPILED_WHEEL_LOCATION
+fi
+
+# ---------------------------------------------------------------------------
+# DPX GPU partition lock
+# ---------------------------------------------------------------------------
+# DPX nodes expose exactly one GPU partition per pod. A host-wide lock file
+# prevents a second job from landing on the same device simultaneously.
+_acquire_dpx_lock() {
+  local dev=(/dev/dri/renderD*)
+  [[ ${#dev[@]} == 1 ]] \
+    || { echo "DPX: expected exactly one render device, found ${#dev[@]}" >&2; return 1; }
+  mkdir -p "$HF_HOME/.vllm-dpx-locks"
+  exec 9>>"$HF_HOME/.vllm-dpx-locks/$(stat -Lc %t-%T "${dev[0]}").lock"
+  flock -w 600 9 || { echo "DPX GPU collision on ${dev[0]}" >&2; return 134; }
 }
 
-# Call the cleanup docker function
-cleanup_docker
+if [[ ${BUILDKITE_AGENT_META_DATA_QUEUE:-} == *dpx* && $gpus != 0 ]]; then
+  _acquire_dpx_lock || exit
+fi
 
-echo "--- Resetting GPUs"
-
-echo "reset" > /opt/amdgpu/etc/gpu_state
-
-while true; do
-        sleep 3
-        if grep -q clean /opt/amdgpu/etc/gpu_state; then
-                echo "GPUs state is \"clean\""
-                break
-        fi
-done
-
-echo "--- Pulling container" 
-image_name="rocm/vllm-ci:${BUILDKITE_COMMIT}"
-container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
-docker pull "${image_name}"
-
-remove_docker_container() {
-   docker rm -f "${container_name}" || docker image rm -f "${image_name}" || true
+# ---------------------------------------------------------------------------
+# Lifecycle logging
+# ---------------------------------------------------------------------------
+# Structured events for infra dashboards keyed on [amd-ci-teardown].
+# Usage: _teardown_log <event> [key=val ...]
+_teardown_log() {
+  local event=$1; shift
+  printf '[amd-ci-teardown] event=%s' "$event" >&2
+  (($#)) && printf ' %s' "$@" >&2
+  printf '\n' >&2
 }
-trap remove_docker_container EXIT
 
-echo "--- Running container"
+# ---------------------------------------------------------------------------
+# Diagnostics bundle (always collected on failure)
+# ---------------------------------------------------------------------------
+# Writes to artifacts/amd-gpu-diagnostics/<job>/diagnostics.log, which the
+# pipeline's artifact_paths uploads even when the step fails.
+diagnostics() {
+  local d=artifacts/amd-gpu-diagnostics/$job
+  mkdir -p "$d"
+  {
+    date
+    echo "node=${VLLM_CI_K8S_NODE_NAME:-?}  pod=${VLLM_CI_K8S_POD_NAME:-?}"
+    echo "--- amd-smi ---"
+    timeout 10 amd-smi list
+    echo "--- rocm-smi pids ---"
+    timeout 10 rocm-smi --showpids
+    echo "--- top processes by RSS ---"
+    ps -eo pid,etime,rss,args --sort=-rss | head -30
+    echo "--- disk / memory ---"
+    df -h /tmp /dev/shm "$HF_HOME"
+    free -g
+    echo "--- devices ---"
+    ls -l /dev/kfd /dev/dri
+  } >"$d/diagnostics.log" 2>&1
+}
 
-HF_CACHE="$(realpath ~)/huggingface"
-mkdir -p "${HF_CACHE}"
-HF_MOUNT="/root/.cache/huggingface"
+# ---------------------------------------------------------------------------
+# Preflight: verify imports and GPU visibility
+# ---------------------------------------------------------------------------
+# -P: the checkout (cwd) has a vllm/ source tree that would shadow the installed package.
+python3 -P -c "import vllm, torch, transformers, ray" || exit 1
 
-commands=$@
-echo "Commands:$commands"
-
-if [[ $commands == *"pytest -v -s basic_correctness/test_basic_correctness.py"* ]]; then
-  commands=${commands//"pytest -v -s basic_correctness/test_basic_correctness.py"/"VLLM_USE_TRITON_FLASH_ATTN=0 pytest -v -s basic_correctness/test_basic_correctness.py"}
+if [[ $gpus != 0 ]]; then
+  echo "--- ROCm info"
+  rocminfo || { diagnostics; exit 1; }
+  python3 - <<EOF || { diagnostics; exit 1; }
+import torch
+n = torch.cuda.device_count()
+assert torch.version.hip and torch.cuda.is_available() and n == $gpus, \
+    f"preflight: expected $gpus ROCm GPU(s), found {n}"
+EOF
 fi
 
-if [[ $commands == *"pytest -v -s models/test_registry.py"* ]]; then
-  commands=${commands//"pytest -v -s models/test_registry.py"/"pytest -v -s models/test_registry.py -k 'not BambaForCausalLM and not GritLM and not Mamba2ForCausalLM and not Zamba2ForCausalLM'"}
-fi
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+# Scrub orchestration vars before handing control to test commands.
+# (VLLM_CI_* that are test knobs are intentionally left — see tests/ci_envs.py)
+unset VLLM_TEST_COMMANDS VLLM_CI_EXPECTED_GPU_COUNT VLLM_CI_DIAGNOSTICS_DIR
 
-if [[ $commands == *"pytest -v -s compile/test_basic_correctness.py"* ]]; then
-  commands=${commands//"pytest -v -s compile/test_basic_correctness.py"/"VLLM_USE_TRITON_FLASH_ATTN=0 pytest -v -s compile/test_basic_correctness.py"}
-fi
+echo "Test commands: $commands"
+echo "--- Test log"
+_teardown_log workload_started "timeout_s=${CONTAINER_TIMEOUT_S:-0}"
 
-if [[ $commands == *"pytest -v -s lora"* ]]; then
-  commands=${commands//"pytest -v -s lora"/"VLLM_ROCM_CUSTOM_PAGED_ATTN=0 pytest -v -s lora"}
-fi
-
-#ignore certain kernels tests
-if [[ $commands == *" kernels/core"* ]]; then
-  commands="${commands} \
-  --ignore=kernels/core/test_fused_quant_layernorm.py \
-  --ignore=kernels/core/test_permute_cols.py"
-fi
-
-if [[ $commands == *" kernels/attention"* ]]; then
-  commands="${commands} \
-  --ignore=kernels/attention/test_attention_selector.py \
-  --ignore=kernels/attention/test_encoder_decoder_attn.py \
-  --ignore=kernels/attention/test_flash_attn.py \
-  --ignore=kernels/attention/test_flashinfer.py \
-  --ignore=kernels/attention/test_prefix_prefill.py \
-  --ignore=kernels/attention/test_cascade_flash_attn.py \
-  --ignore=kernels/attention/test_mha_attn.py \
-  --ignore=kernels/attention/test_lightning_attn.py \
-  --ignore=kernels/attention/test_attention.py"
-fi
-
-if [[ $commands == *" kernels/quantization"* ]]; then
-  commands="${commands} \
-  --ignore=kernels/quantization/test_int8_quant.py \
-  --ignore=kernels/quantization/test_machete_mm.py \
-  --ignore=kernels/quantization/test_block_fp8.py \
-  --ignore=kernels/quantization/test_block_int8.py \
-  --ignore=kernels/quantization/test_marlin_gemm.py \
-  --ignore=kernels/quantization/test_cutlass_scaled_mm.py \
-  --ignore=kernels/quantization/test_int8_kernel.py"
-fi
-
-if [[ $commands == *" kernels/mamba"* ]]; then
-  commands="${commands} \
-  --ignore=kernels/mamba/test_mamba_mixer2.py \
-  --ignore=kernels/mamba/test_causal_conv1d.py \
-  --ignore=kernels/mamba/test_mamba_ssm_ssd.py"
-fi
-
-if [[ $commands == *" kernels/moe"* ]]; then
-  commands="${commands} \
-  --ignore=kernels/moe/test_moe.py \
-  --ignore=kernels/moe/test_cutlass_moe.py \
-  --ignore=kernels/moe/test_triton_moe_ptpc_fp8.py"
-fi
-
-#ignore certain Entrypoints/openai tests
-if [[ $commands == *" entrypoints/openai "* ]]; then
-  commands=${commands//" entrypoints/openai "/" entrypoints/openai \
-  --ignore=entrypoints/openai/test_audio.py \
-  --ignore=entrypoints/openai/test_shutdown.py \
-  --ignore=entrypoints/openai/test_completion.py \
-  --ignore=entrypoints/openai/test_sleep.py \
-  --ignore=entrypoints/openai/test_models.py \
-  --ignore=entrypoints/openai/test_lora_adapters.py \
-  --ignore=entrypoints/openai/test_return_tokens_as_ids.py \
-  --ignore=entrypoints/openai/test_root_path.py \
-  --ignore=entrypoints/openai/test_tokenization.py \
-  --ignore=entrypoints/openai/test_prompt_validation.py "}
-fi
-
-#ignore certain Entrypoints/llm tests
-if [[ $commands == *" entrypoints/llm "* ]]; then
-  commands=${commands//" entrypoints/llm "/" entrypoints/llm \
-  --ignore=entrypoints/llm/test_chat.py \
-  --ignore=entrypoints/llm/test_accuracy.py \
-  --ignore=entrypoints/llm/test_init.py \
-  --ignore=entrypoints/llm/test_prompt_validation.py "}
-fi
-
-# --ignore=entrypoints/openai/test_encoder_decoder.py \
-# --ignore=entrypoints/openai/test_embedding.py \
-# --ignore=entrypoints/openai/test_oot_registration.py
-# --ignore=entrypoints/openai/test_accuracy.py \
-# --ignore=entrypoints/openai/test_models.py <= Fails on MI250 but passes on MI300 as of 2025-03-13
-
-
-PARALLEL_JOB_COUNT=8
-MYPYTHONPATH=".."
-
-# check if the command contains shard flag, we will run all shards in parallel because the host have 8 GPUs. 
-if [[ $commands == *"--shard-id="* ]]; then
-  # assign job count as the number of shards used   
-  commands=${commands//"--num-shards= "/"--num-shards=${PARALLEL_JOB_COUNT} "}
-  for GPU in $(seq 0 $(($PARALLEL_JOB_COUNT-1))); do
-    # assign shard-id for each shard
-    commands_gpu=${commands//"--shard-id= "/"--shard-id=${GPU} "}
-    echo "Shard ${GPU} commands:$commands_gpu"
-    echo "Render devices: $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES"
-    docker run \
-        --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
-        --network=host \
-        --shm-size=16gb \
-        --rm \
-        -e HIP_VISIBLE_DEVICES="${GPU}" \
-        -e HF_TOKEN \
-        -e AWS_ACCESS_KEY_ID \
-        -e AWS_SECRET_ACCESS_KEY \
-        -v "${HF_CACHE}:${HF_MOUNT}" \
-        -e "HF_HOME=${HF_MOUNT}" \
-        -e "PYTHONPATH=${MYPYTHONPATH}" \
-        --name "${container_name}_${GPU}" \
-        "${image_name}" \
-        /bin/bash -c "${commands_gpu}" \
-        |& while read -r line; do echo ">>Shard $GPU: $line"; done &
-    PIDS+=($!)
-  done
-  #wait for all processes to finish and collect exit codes
-  for pid in "${PIDS[@]}"; do
-    wait "${pid}"
-    STATUS+=($?)
-  done
-  for st in "${STATUS[@]}"; do
-    if [[ ${st} -ne 0 ]]; then
-      echo "One of the processes failed with $st"
-      exit "${st}"
-    fi
-  done
+rc=0
+if [[ ${CONTAINER_TIMEOUT_S:-0} -gt 0 ]]; then
+  # timeout fires TERM, then KILL after 10 s — mirrors the old docker run path.
+  # Not --foreground: the whole process group (pytest, engine workers) must stop, not just bash.
+  # That group is in the background of the job's PTY, where reading the terminal stops it
+  # (SIGTTIN: apt, transformers' trust_remote_code prompt), so stdin is /dev/null.
+  timeout --verbose --signal=TERM --kill-after=10s \
+    "${CONTAINER_TIMEOUT_S}s" bash -o pipefail -c "$commands" </dev/null || rc=$?
 else
-  echo "Render devices: $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES"
-  docker run \
-          --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
-          --network=host \
-          --shm-size=16gb \
-          --rm \
-          -e HIP_VISIBLE_DEVICES=0 \
-          -e HF_TOKEN \
-          -e AWS_ACCESS_KEY_ID \
-          -e AWS_SECRET_ACCESS_KEY \
-          -v "${HF_CACHE}:${HF_MOUNT}" \
-          -e "HF_HOME=${HF_MOUNT}" \
-          -e "PYTHONPATH=${MYPYTHONPATH}" \
-          --name "${container_name}" \
-          "${image_name}" \
-          /bin/bash -c "${commands}"
+  bash -o pipefail -c "$commands" </dev/null || rc=$?
 fi
+
+[[ $rc == 5   ]] && rc=0   # pytest exit 5 = no tests collected, not a failure
+[[ $rc == 124 ]] && _teardown_log deadline_exhausted \
+  "configured_s=${CONTAINER_TIMEOUT_S:-0}" "status=$rc"
+_teardown_log workload_finished "status=$rc"
+
+[[ $rc != 0 ]] && diagnostics
+exit $rc

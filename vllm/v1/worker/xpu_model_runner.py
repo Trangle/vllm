@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from functools import partial
 
 import torch
 
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-if TYPE_CHECKING:
-    pass
-
-logger = init_logger(__name__)
+from vllm.utils.torch_utils import supports_xpu_graph
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.mm_encoder_model_runner import MMEncoderModelRunner
 
 
 class XPUModelRunner(GPUModelRunner):
@@ -25,31 +21,40 @@ class XPUModelRunner(GPUModelRunner):
     ):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
-        # FIXME: To be verified.
-        self.cascade_attn_enabled = False
 
-    def _init_device_properties(self) -> None:
-        self.num_sms = None
 
-    def _sync_device(self) -> None:
-        torch.xpu.synchronize()
+class XPUMMEncoderModelRunner(MMEncoderModelRunner):
+    """An encoder-only model runner for XPU devices."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        with _torch_cuda_wrapper():
+            super().__init__(vllm_config, device)
 
 
 @contextmanager
 def _torch_cuda_wrapper():
-    class _EventPlaceholder:
-        def __init__(self, *args, **kwargs) -> None:
-            self.record = lambda: None
-            self.synchronize = lambda: None
+    # Replace cuda APIs with xpu APIs. Each callable gets its own functools.partial
+    # so it is not the same object as torch.xpu.* (Torch Dynamo _get_handlers()
+    # asserts on duplicate registration when cuda aliases xpu directly).
+    torch.cuda.Stream = torch.xpu.Stream
+    torch.cuda.default_stream = partial(torch.xpu.current_stream)
+    torch.cuda.current_stream = partial(torch.xpu.current_stream)
+    torch.cuda.stream = partial(torch.xpu.stream)
+    torch.cuda.set_stream = partial(torch.xpu.set_stream)
 
-    try:
-        # replace cuda APIs with xpu APIs, this should work by default
-        torch.cuda.Event = torch.xpu.Event
-        torch.cuda.Stream = torch.xpu.Stream
-        torch.cuda.default_stream = torch.xpu.current_stream
-        torch.cuda.current_stream = torch.xpu.current_stream
-        torch.cuda.stream = torch.xpu.stream
-        yield
-    finally:
-        # if anything goes wrong, just patch it with a placeholder
-        torch.cuda.Event = _EventPlaceholder
+    # torch.xpu.Event does not accept the ``blocking`` or ``external`` kwargs
+    # that torch.cuda.Event supports, so drop them here.
+    def _xpu_event(*args, blocking=None, external=None, **kwargs):
+        return torch.xpu.Event(*args, **kwargs)
+
+    torch.cuda.Event = _xpu_event
+    if supports_xpu_graph():
+        torch.cuda.graph = partial(torch.xpu.graph)
+        torch.cuda.CUDAGraph = torch.xpu.XPUGraph
+        torch.cuda.graph_pool_handle = partial(torch.xpu.graph_pool_handle)
+        torch.cuda.is_current_stream_capturing = torch.xpu.is_current_stream_capturing
+    yield

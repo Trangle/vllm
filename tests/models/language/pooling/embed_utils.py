@@ -2,10 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
 
+import openai
 import pytest
 
 from tests.conftest import HfRunner
 from tests.models.utils import EmbedModelInfo, check_embeddings_close, matryoshka_fy
+from vllm.entrypoints.pooling.embed.protocol import EmbeddingResponse
+
+
+def float_embeddings(response: EmbeddingResponse) -> list[list[float]]:
+    embeddings = []
+    for d in response.data:
+        assert isinstance(d.embedding, list)
+        embeddings.append(d.embedding)
+    return embeddings
 
 
 def run_embedding_correctness_test(
@@ -65,3 +75,16 @@ def correctness_test_embed_models(
             hf_model_callback(hf_model)
 
         run_embedding_correctness_test(hf_model, example_prompts, vllm_outputs)
+
+
+async def run_client_embeddings(
+    client: openai.AsyncOpenAI,
+    model_name: str,
+    queries: list[str],
+    instruction: str = "",
+) -> list[list[float]]:
+    outputs = await client.embeddings.create(
+        model=model_name,
+        input=[instruction + q for q in queries],
+    )
+    return [data.embedding for data in outputs.data]

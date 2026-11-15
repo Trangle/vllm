@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 
-from vllm.multimodal.video import sample_frames_from_video
+from vllm.assets.image import ImageAsset
+from vllm.platforms import current_platform
 
 from ....conftest import VIDEO_ASSETS
+from .vlm_utils.builders import sample_frames_with_video_metadata
 
 models = ["Qwen/Qwen2.5-VL-3B-Instruct"]
 target_dtype = "bfloat16"
 
 VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
+IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 
 
 def qwen2_5_vl_chat_template(*query):
@@ -28,12 +32,37 @@ VIDEO_PROMPTS = VIDEO_ASSETS.prompts(
 )
 
 
+WINDOW_ATTN_IMAGE_PROMPT = qwen2_5_vl_chat_template(
+    IMAGE_PLACEHOLDER,
+    "Describe the image.",
+)
+IMAGE_ONLY_LIMIT_MM_PER_PROMPT = {"image": 1, "video": 0}
+
+
+def _window_attention_regression_image():
+    # image from regression issue: https://github.com/vllm-project/vllm/issues/15122
+    image = ImageAsset("hato").pil_image
+    return image.resize((image.width // 2, image.height // 2))
+
+
+def _encoder_cudagraph_config(*, max_vision_items: int) -> dict:
+    return {
+        "cudagraph_mm_encoder": True,
+        "encoder_cudagraph_max_vision_items_per_batch": max_vision_items,
+    }
+
+
 @pytest.mark.core_model
 @pytest.mark.parametrize("model", models)
-@pytest.mark.parametrize("video_pruning_rate", [0.0, 0.75])
+@pytest.mark.parametrize(
+    "video_pruning_rate", [0.0] if current_platform.is_cpu() else [0.0, 0.75]
+)
 @pytest.mark.parametrize("num_frames", [16])
 @pytest.mark.parametrize("dtype", [target_dtype])
 @pytest.mark.parametrize("max_tokens", [128])
+@pytest.mark.parametrize(
+    "use_bytecode_hook", [True] if current_platform.is_cpu() else [True, False]
+)
 def test_qwen2_5_vl_evs_functionality(
     vllm_runner,
     video_assets,
@@ -42,14 +71,20 @@ def test_qwen2_5_vl_evs_functionality(
     num_frames: int,
     dtype: str,
     max_tokens: int,
+    use_bytecode_hook: bool,
+    monkeypatch,
 ) -> None:
     """Test EVS (Efficient Video Sampling) functionality with different
     pruning rates.
     """
+    # Set the environment variable for this test
+    monkeypatch.setenv("VLLM_USE_BYTECODE_HOOK", "1" if use_bytecode_hook else "0")
 
     # Sample frames from video assets
     sampled_vids = [
-        sample_frames_from_video(asset.np_ndarrays, num_frames)
+        sample_frames_with_video_metadata(
+            (asset.np_ndarrays, asset.metadata), num_frames
+        )
         for asset in video_assets
     ]
 
@@ -61,10 +96,8 @@ def test_qwen2_5_vl_evs_functionality(
         model,
         runner="generate",
         max_model_len=4000,
-        max_num_seqs=1,
         dtype=dtype,
         limit_mm_per_prompt={"video": 1},
-        tensor_parallel_size=1,
         video_pruning_rate=video_pruning_rate,
     ) as vllm_model:
         # Generate output - this should not crash
@@ -84,10 +117,15 @@ def test_qwen2_5_vl_evs_functionality(
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("model", models)
-@pytest.mark.parametrize("video_pruning_rate", [0.0, 0.75])
+@pytest.mark.parametrize(
+    "video_pruning_rate", [0.0] if current_platform.is_cpu() else [0.0, 0.75]
+)
 @pytest.mark.parametrize("num_frames", [16])
 @pytest.mark.parametrize("dtype", [target_dtype])
 @pytest.mark.parametrize("max_tokens", [128])
+@pytest.mark.parametrize(
+    "use_bytecode_hook", [True] if current_platform.is_cpu() else [True, False]
+)
 def test_qwen2_5_vl_evs_batched_videos(
     vllm_runner,
     video_assets,
@@ -96,6 +134,8 @@ def test_qwen2_5_vl_evs_batched_videos(
     num_frames: int,
     dtype: str,
     max_tokens: int,
+    use_bytecode_hook: bool,
+    monkeypatch,
 ) -> None:
     """Test EVS functionality with batched videos.
 
@@ -104,9 +144,13 @@ def test_qwen2_5_vl_evs_batched_videos(
     2. Both pruning configurations work with multiple videos
     3. The model doesn't crash when processing multiple videos simultaneously
     """
+    # Set the environment variable for this test
+    monkeypatch.setenv("VLLM_USE_BYTECODE_HOOK", "1" if use_bytecode_hook else "0")
     # Sample frames from video assets
     sampled_vids = [
-        sample_frames_from_video(asset.np_ndarrays, num_frames)
+        sample_frames_with_video_metadata(
+            (asset.np_ndarrays, asset.metadata), num_frames
+        )
         for asset in video_assets
     ]
 
@@ -137,4 +181,116 @@ def test_qwen2_5_vl_evs_batched_videos(
             assert len(output_text) > 0
 
             # Ensure the output is a string
+            assert isinstance(output_text, str)
+
+
+@pytest.mark.core_model
+@pytest.mark.skipif(
+    current_platform.is_cpu(), reason="17k-token video prefill is too slow on CPU"
+)
+@pytest.mark.parametrize("model", models)
+def test_qwen2_5_vl_video_fits_max_model_len(vllm_runner, model) -> None:
+    num_frames = 60
+    video = np.zeros((num_frames, 504, 896, 3), dtype=np.uint8)
+    metadata = {
+        "fps": 2.0,
+        "duration": num_frames / 2.0,
+        "total_num_frames": num_frames,
+        "frames_indices": list(range(num_frames)),
+        "video_backend": "opencv",
+        "do_sample_frames": False,
+    }
+    prompt = qwen2_5_vl_chat_template(VIDEO_PLACEHOLDER, "Describe the video.")
+
+    with vllm_runner(
+        model,
+        runner="generate",
+        max_model_len=20000,
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=8192,
+        dtype=target_dtype,
+        limit_mm_per_prompt={"image": 0, "video": 1},
+    ) as vllm_model:
+        outputs = vllm_model.generate_greedy([prompt], 8, videos=[(video, metadata)])
+
+    output_ids, output_text = outputs[0]
+    assert len(output_ids) > 17280
+    assert len(output_text) > 0
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize("model", models)
+@pytest.mark.parametrize("dtype", [target_dtype])
+@pytest.mark.parametrize("max_tokens", [128])
+@pytest.mark.parametrize(
+    "use_bytecode_hook", [True] if current_platform.is_cpu() else [True, False]
+)
+def test_qwen2_5_vl_window_attention_image(
+    vllm_runner,
+    model,
+    dtype: str,
+    max_tokens: int,
+    use_bytecode_hook: bool,
+    monkeypatch,
+) -> None:
+    """Regression test for Qwen2.5 window-attention image path."""
+    monkeypatch.setenv("VLLM_USE_BYTECODE_HOOK", "1" if use_bytecode_hook else "0")
+
+    prompt = [WINDOW_ATTN_IMAGE_PROMPT]
+    images = [[_window_attention_regression_image()]]
+
+    with vllm_runner(
+        model,
+        runner="generate",
+        max_model_len=4096,
+        dtype=dtype,
+        limit_mm_per_prompt=IMAGE_ONLY_LIMIT_MM_PER_PROMPT,
+        compilation_config=_encoder_cudagraph_config(max_vision_items=1),
+    ) as vllm_model:
+        outputs = vllm_model.generate_greedy(prompt, max_tokens, images=images)
+
+        assert len(outputs) == 1
+        output_ids, output_text = outputs[0]
+        assert len(output_ids) > 0
+        assert len(output_text) > 0
+        assert isinstance(output_text, str)
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize("model", models)
+@pytest.mark.parametrize("dtype", [target_dtype])
+@pytest.mark.parametrize("max_tokens", [128])
+@pytest.mark.parametrize(
+    "use_bytecode_hook", [True] if current_platform.is_cpu() else [True, False]
+)
+def test_qwen2_5_vl_window_attention_image_batch(
+    vllm_runner,
+    model,
+    dtype: str,
+    max_tokens: int,
+    use_bytecode_hook: bool,
+    monkeypatch,
+) -> None:
+    """Regression test window-attention with a small image batch."""
+    monkeypatch.setenv("VLLM_USE_BYTECODE_HOOK", "1" if use_bytecode_hook else "0")
+
+    image = _window_attention_regression_image()
+    prompts = [WINDOW_ATTN_IMAGE_PROMPT, WINDOW_ATTN_IMAGE_PROMPT]
+    images = [[image], [image]]
+
+    with vllm_runner(
+        model,
+        runner="generate",
+        max_model_len=4096,
+        max_num_seqs=2,
+        dtype=dtype,
+        limit_mm_per_prompt=IMAGE_ONLY_LIMIT_MM_PER_PROMPT,
+        compilation_config=_encoder_cudagraph_config(max_vision_items=2),
+    ) as vllm_model:
+        outputs = vllm_model.generate_greedy(prompts, max_tokens, images=images)
+
+        assert len(outputs) == 2
+        for output_ids, output_text in outputs:
+            assert len(output_ids) > 0
+            assert len(output_text) > 0
             assert isinstance(output_text, str)

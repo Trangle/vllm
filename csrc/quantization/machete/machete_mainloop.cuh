@@ -17,8 +17,9 @@
 // before feeding them into the tensor cores in registers, we need the weight
 // matrix to be A. To achieve this we compute the transpose of Y = XW^t as
 // Y^t = W^tX^t. This is mostly done outside of this file in
-// csrc/quantization/machete/machete_mm_kernel.cuh, but this why A is the
-// quantized/narrow type and has the prepacked layout despite the API being:
+// csrc/quantization/machete/machete_mm_kernel.cuh, but this why
+// A is the quantized/narrow type and has the prepacked layout despite the API
+// being:
 //   B_prepacked = machete_prepack_B(B)
 //   Y = machete_mm(A, B_prepacked)
 //
@@ -154,6 +155,7 @@ struct MacheteCollectiveMma {
   struct DispatchPolicy {
     constexpr static int Stages = PipelineStages;
     using ClusterShape = ClusterShape_MNK;
+    using ArchTag = arch::Sm90;
     using Schedule = KernelScheduleType;
   };
 
@@ -617,7 +619,7 @@ struct MacheteCollectiveMma {
 
   // Same as upstream, should be kept the same when possible, not formatted for
   // easier comparison
-  //   with `SwapAB ? N : M -> M` since we dont support SwapAB
+  //   with `SwapAB ? N : M -> M` since we don't support SwapAB
   // clang-format off
   template<class ProblemShape>
   static bool

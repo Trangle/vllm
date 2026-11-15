@@ -33,7 +33,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     quantize_weights,
 )
 from vllm.scalar_type import ScalarType, scalar_types
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 DEFAULT_MODELS = ["meta-llama/Llama-3-8b", "meta-llama/Llama-2-70b-hf"]
 DEFAULT_BATCH_SIZES = [1, 16, 32, 64, 128, 256, 512, 1024]
@@ -56,7 +56,7 @@ def terse_type_name(dt):
     }[dt]
 
 
-@dataclass
+@dataclass(slots=True)
 class BenchmarkTensors:
     w_ref: torch.Tensor
     a: torch.Tensor
@@ -70,7 +70,7 @@ class BenchmarkTensors:
     w_tok_s: torch.Tensor | None
 
 
-@dataclass
+@dataclass(slots=True)
 class TypeConfig:
     act_type: torch.dtype
     weight_type: ScalarType
@@ -220,10 +220,8 @@ def marlin_create_bench_fn(bt: BenchmarkTensors) -> Callable:
             bt.w_g_s, bt.w_ref.shape[0], bt.w_ref.shape[1], bt.group_size
         )
 
-    sort_indices = torch.empty(0, dtype=torch.int, device=device)
-    g_idx = torch.empty(0, dtype=torch.int, device=device)
     w_q = ops.gptq_marlin_repack(
-        bt.w_q, sort_indices, bt.w_ref.shape[0], bt.w_ref.shape[1], bt.wtype.size_bits
+        bt.w_q, bt.w_ref.shape[0], bt.w_ref.shape[1], bt.wtype.size_bits
     )
 
     if bt.a.dtype.is_floating_point:
@@ -231,7 +229,7 @@ def marlin_create_bench_fn(bt: BenchmarkTensors) -> Callable:
         assert bt.w_tok_s is None
         assert bt.group_size is not None
 
-        fn = lambda: ops.gptq_marlin_gemm(
+        fn = lambda: ops.marlin_gemm(
             a=bt.a,
             c=None,
             b_q_weight=w_q,
@@ -239,14 +237,11 @@ def marlin_create_bench_fn(bt: BenchmarkTensors) -> Callable:
             b_scales=w_s,
             global_scale=None,
             b_zeros=w_zp,
-            g_idx=g_idx,
-            perm=sort_indices,
             workspace=workspace.scratch,
             b_q_type=bt.wtype,
             size_m=bt.a.shape[0],
             size_n=bt.w_ref.shape[1],
             size_k=bt.w_ref.shape[0],
-            is_k_full=True,
             is_zp_float=False,
         )
     else:

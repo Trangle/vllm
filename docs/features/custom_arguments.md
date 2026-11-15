@@ -4,6 +4,9 @@ You can use vLLM *custom arguments* to pass in arguments which are not part of t
 
 Custom arguments can be useful if, for example, you want to use a [custom logits processor](./custom_logitsprocs.md) without modifying the vLLM source code.
 
+!!! note
+    Make sure your custom logits processor have implemented `validate_params` for custom arguments. Otherwise, invalid custom arguments can cause unexpected behaviour.
+
 ## Offline Custom Arguments
 
 Custom arguments passed to `SamplingParams.extra_args` as a `dict` will be visible to any code which has access to `SamplingParams`:
@@ -16,7 +19,7 @@ This allows arguments which are not already part of `SamplingParams` to be passe
 
 ## Online Custom Arguments
 
-The vLLM REST API allows custom arguments to be passed to the vLLM server via `vllm_xargs`. The example below integrates custom arguments into a vLLM REST API request:
+The OpenAI-compatible REST API and Anthropic-compatible `/v1/messages` endpoint allow custom arguments to be passed to the vLLM server via `vllm_xargs`. The example below integrates custom arguments into a vLLM REST API request:
 
 ``` bash
 curl http://localhost:8000/v1/completions \

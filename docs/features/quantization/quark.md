@@ -20,7 +20,7 @@ for more installation details.
 Additionally, install `vllm` and `lm-evaluation-harness` for evaluation:
 
 ```bash
-pip install vllm git+https://github.com/EleutherAI/lm-evaluation-harness.git@206b7722158f58c35b7ffcd53b035fdbdda5126d#egg=lm-eval[api]
+pip install vllm "lm-eval[api]>=0.4.12"
 ```
 
 ## Quantization Process
@@ -48,7 +48,9 @@ to fetch model and tokenizer.
     MAX_SEQ_LEN = 512
 
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, device_map="auto", torch_dtype="auto",
+        MODEL_ID,
+        device_map="auto",
+        dtype="auto",
     )
     model.eval()
 
@@ -75,10 +77,18 @@ to [Adding Calibration Datasets](https://quark.docs.amd.com/latest/pytorch/calib
     dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
     text_data = dataset["text"][:NUM_CALIBRATION_DATA]
 
-    tokenized_outputs = tokenizer(text_data, return_tensors="pt",
-        padding=True, truncation=True, max_length=MAX_SEQ_LEN)
-    calib_dataloader = DataLoader(tokenized_outputs['input_ids'],
-        batch_size=BATCH_SIZE, drop_last=True)
+    tokenized_outputs = tokenizer(
+        text_data,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=MAX_SEQ_LEN,
+    )
+    calib_dataloader = DataLoader(
+        tokenized_outputs['input_ids'],
+        batch_size=BATCH_SIZE,
+        drop_last=True,
+    )
     ```
 
 ### 3. Set the Quantization Configuration
@@ -90,7 +100,7 @@ kv-cache and the quantization algorithm is AutoSmoothQuant.
 
 !!! note
     Note the quantization algorithm needs a JSON config file and the config file is located in
-    [Quark Pytorch examples](https://quark.docs.amd.com/latest/pytorch/pytorch_examples.html),
+    [Quark PyTorch examples](https://quark.docs.amd.com/latest/pytorch/pytorch_examples.html),
     under the directory `examples/torch/language_modeling/llm_ptq/models`. For example,
     AutoSmoothQuant config file for Llama is
     `examples/torch/language_modeling/llm_ptq/models/llama/autosmoothquant_config.json`.
@@ -103,26 +113,32 @@ kv-cache and the quantization algorithm is AutoSmoothQuant.
                                         load_quant_algo_config_from_file)
 
     # Define fp8/per-tensor/static spec.
-    FP8_PER_TENSOR_SPEC = FP8E4M3PerTensorSpec(observer_method="min_max",
-        is_dynamic=False).to_quantization_spec()
+    FP8_PER_TENSOR_SPEC = FP8E4M3PerTensorSpec(
+        observer_method="min_max",
+        is_dynamic=False,
+    ).to_quantization_spec()
 
     # Define global quantization config, input tensors and weight apply FP8_PER_TENSOR_SPEC.
-    global_quant_config = QuantizationConfig(input_tensors=FP8_PER_TENSOR_SPEC,
-        weight=FP8_PER_TENSOR_SPEC)
+    global_quant_config = QuantizationConfig(
+        input_tensors=FP8_PER_TENSOR_SPEC,
+        weight=FP8_PER_TENSOR_SPEC,
+    )
 
     # Define quantization config for kv-cache layers, output tensors apply FP8_PER_TENSOR_SPEC.
     KV_CACHE_SPEC = FP8_PER_TENSOR_SPEC
     kv_cache_layer_names_for_llama = ["*k_proj", "*v_proj"]
-    kv_cache_quant_config = {name :
-        QuantizationConfig(input_tensors=global_quant_config.input_tensors,
-                        weight=global_quant_config.weight,
-                        output_tensors=KV_CACHE_SPEC)
-        for name in kv_cache_layer_names_for_llama}
+    kv_cache_quant_config = {
+        name: QuantizationConfig(
+            input_tensors=global_quant_config.input_tensors,
+            weight=global_quant_config.weight,
+            output_tensors=KV_CACHE_SPEC,
+        )
+        for name in kv_cache_layer_names_for_llama
+    }
     layer_quant_config = kv_cache_quant_config.copy()
 
     # Define algorithm config by config file.
-    LLAMA_AUTOSMOOTHQUANT_CONFIG_FILE =
-        'examples/torch/language_modeling/llm_ptq/models/llama/autosmoothquant_config.json'
+    LLAMA_AUTOSMOOTHQUANT_CONFIG_FILE = "examples/torch/language_modeling/llm_ptq/models/llama/autosmoothquant_config.json"
     algo_config = load_quant_algo_config_from_file(LLAMA_AUTOSMOOTHQUANT_CONFIG_FILE)
 
     EXCLUDE_LAYERS = ["lm_head"]
@@ -131,7 +147,8 @@ kv-cache and the quantization algorithm is AutoSmoothQuant.
         layer_quant_config=layer_quant_config,
         kv_cache_quant_config=kv_cache_quant_config,
         exclude=EXCLUDE_LAYERS,
-        algo_config=algo_config)
+        algo_config=algo_config,
+    )
     ```
 
 ### 4. Quantize the Model and Export
@@ -165,8 +182,11 @@ for more exporting format details.
     EXPORT_DIR = MODEL_ID.split("/")[1] + "-w-fp8-a-fp8-kvcache-fp8-pertensor-autosmoothquant"
     exporter = ModelExporter(config=export_config, export_dir=EXPORT_DIR)
     with torch.no_grad():
-        exporter.export_safetensors_model(freezed_model,
-            quant_config=quant_config, tokenizer=tokenizer)
+        exporter.export_safetensors_model(
+            freezed_model,
+            quant_config=quant_config,
+            tokenizer=tokenizer,
+        )
     ```
 
 ### 5. Evaluation in vLLM
@@ -189,8 +209,11 @@ Now, you can load and run the Quark quantized model directly through the LLM ent
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
     # Create an LLM.
-    llm = LLM(model="Llama-2-70b-chat-hf-w-fp8-a-fp8-kvcache-fp8-pertensor-autosmoothquant",
-            kv_cache_dtype='fp8',quantization='quark')
+    llm = LLM(
+        model="Llama-2-70b-chat-hf-w-fp8-a-fp8-kvcache-fp8-pertensor-autosmoothquant",
+        kv_cache_dtype="fp8",
+        quantization="quark",
+    )
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
     outputs = llm.generate(prompts, sampling_params)
@@ -258,4 +281,115 @@ python quantize_quark.py --model_dir Qwen/Qwen1.5-MoE-A2.7B-Chat \
     --group_size 32
 ```
 
-The current integration supports [all combination of FP4, FP6_E3M2, FP6_E2M3](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/ocp_mx_utils.py) used for either weights or activations. Eventually, some target hardware support mixed precision GEMM, as AMD Instinct MI350/MI355, for example using FP6 for activations and FP4 for weights.
+The current integration supports [all combination of FP4, FP6_E3M2, FP6_E2M3](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/ocp_mx_utils.py) used for either weights or activations.
+
+## Using Quark Quantized layerwise Auto Mixed Precision (AMP) Models
+
+vLLM also supports loading layerwise mixed precision model quantized using AMD Quark. Currently, mixed scheme of {MXFP4, FP8} is supported, where FP8 here denotes for FP8 per-tensor scheme. More mixed precision schemes are planned to be supported in a near future, including
+
+- Unquantized Linear and/or MoE layer(s) as an option for each layer, i.e., mixed of {MXFP4, FP8, BF16/FP16}
+- MXFP6 quantization extension, i.e., {MXFP4, MXFP6, FP8, BF16/FP16}
+
+Although one can maximize serving throughput using the lowest precision supported on a given device (e.g. MXFP4 for AMD Instinct MI355, FP8 for AMD Instinct MI300), these aggressive schemes can be detrimental to accuracy recovering from quantization on target tasks. Mixed precision allows to strike a balance between maximizing accuracy and throughput.
+
+There are two steps to generate and deploy a mixed precision model quantized with AMD Quark, as shown below.
+
+### 1. Quantize a model using mixed precision in AMD Quark
+
+Firstly, the layerwise mixed-precision configuration for a given LLM model is searched and then quantized using AMD Quark. We will provide a detailed tutorial with Quark APIs later.
+
+As examples, we provide some ready-to-use quantized mixed precision model to show the usage in vLLM and the accuracy benefits. They are:
+
+- amd/Llama-2-70b-chat-hf-WMXFP4FP8-AMXFP4FP8-AMP-KVFP8
+- amd/Mixtral-8x7B-Instruct-v0.1-WMXFP4FP8-AMXFP4FP8-AMP-KVFP8
+- amd/Qwen3-8B-WMXFP4FP8-AMXFP4FP8-AMP-KVFP8
+
+### 2. inference the quantized mixed precision model in vLLM
+
+Models quantized with AMD Quark using mixed precision can natively be reload in vLLM, and e.g. evaluated using lm-evaluation-harness as follows:
+
+```bash
+lm_eval --model vllm \
+    --model_args pretrained=amd/Llama-2-70b-chat-hf-WMXFP4FP8-AMXFP4FP8-AMP-KVFP8,tensor_parallel_size=4,dtype=auto,trust_remote_code=False \
+    --tasks mmlu \
+    --batch_size auto
+```
+
+## Online Quantization
+
+All the workflows above are *offline* quantization: you run a script, write a new quantized checkpoint to disk, and later load it for serving. This produces the most accurate and smallest checkpoints because it can run accuracy-recovery algorithms (rotation, SmoothQuant, GPTQ, AWQ) during export, but it requires a separate quantization step and a second copy of the model on disk.
+
+*Online* quantization instead quantizes the weights at load time, directly from a high-precision checkpoint, and offers several advantages over the offline flow:
+
+- **No export step** — serve directly from the original `bf16`/`fp16` checkpoint; no separate quantization run before deployment.
+- **No extra disk footprint** — nothing new is written to disk, so there is no second copy of the model to store or manage.
+- **No calibration data** — activations are scaled dynamically at runtime, so no calibration dataset is needed.
+- **Fast iteration** — switch schemes or per-layer selections instantly by changing a config, without re-exporting.
+
+### vLLM online quantization
+
+vLLM has [built-in online quantization](online.md) that skips the export step: it loads an ordinary high-precision (`bf16`) checkpoint and quantizes each layer's weights to schemes such as FP8 or MXFP4 at load time, without a pre-quantized checkpoint or calibration data. No new checkpoint is written to disk. See [Online Quantization](online.md) for the supported schemes and configuration.
+
+### Quark online quantization
+
+AMD Quark provides its own online path, exposed as the `quark_online` quantization backend, for users who want parity with Quark's offline export and Quark's per-layer mixed-precision configs. Like vLLM's built-in online quantization, it quantizes weights inside the weight-loading hook just before serving and writes no new checkpoint.
+
+Its quant math is aligned byte-for-byte with Quark's offline export, so what you validate online is what you get offline. Use it to *find* the scheme and per-layer selection you want.
+
+Compared to vLLM's built-in online quantization, the `quark_online` plugin adds:
+
+- **Flexible config parsing** — a terse config expands into Quark's verbose per-layer config, delegating all per-layer matching to a real `QuarkConfig`.
+- **Per-layer / mixed schemes** — dispatch a different method per layer (e.g. MXFP4 experts with FP8 attention on an MoE model). Each online method subclasses the matching offline scheme, so a load-time quantized layer runs the identical inference kernel as an offline one.
+- **Re-quantizing an already-quantized checkpoint** — an FP8 block-scale checkpoint (e.g. DeepSeek-R1) is dequantized and re-quantized to a target scheme layer-locally at load time, with no new checkpoint.
+
+The plugin ships in AMD Quark — no fork of vLLM, no patched checkpoint format; see the [Quark documentation](https://quark.docs.amd.com/latest/) for details. Three presets ship ready to use:
+
+| Preset key | Scheme |
+| --- | --- |
+| `ptpc_fp8` | FP8 E4M3, per-channel weight + dynamic per-token activation |
+| `mxfp4` | MXFP4, per-group (group size 32) with E8M0 block scale |
+| `linear_ptpc_fp8_moe_mxfp4` | Mixed: attention in FP8, MoE experts in MXFP4 |
+
+### Python API
+
+```python
+from vllm import LLM, SamplingParams
+from quark.online_quantization.vllm import HF_QUANTIZATION_CONFIGS
+
+llm = LLM(
+    model="Qwen/Qwen3-30B-A3B-Thinking-2507",
+    quantization="quark_online",
+    hf_overrides=HF_QUANTIZATION_CONFIGS["ptpc_fp8"],
+    enforce_eager=True,
+    tensor_parallel_size=1,
+)
+out = llm.generate(["The capital of France is"], SamplingParams(temperature=0.0, max_tokens=100))
+print(out)
+```
+
+### Native vLLM CLI
+
+```bash
+export VLLM_PLUGINS="${VLLM_PLUGINS:-quark_online_quant}"
+ONLINE_QUANT_CONFIG='{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head"]}}'
+
+vllm serve Qwen/Qwen3-8B \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --additional-config "$ONLINE_QUANT_CONFIG"
+```
+
+### Re-quantizing an offline checkpoint
+
+No extra arguments — the same `hf_overrides` detects the checkpoint's existing config and merges it automatically:
+
+```python
+llm = LLM(
+    model="deepseek-ai/DeepSeek-R1",           # ships quant_method: "fp8"
+    quantization="quark_online",
+    hf_overrides=HF_QUANTIZATION_CONFIGS["ptpc_fp8"],
+    tensor_parallel_size=8,
+)
+```
+
+The plugin can be disabled with `QUARK_DISABLE_VLLM_PLUGIN=1`, and it steps aside automatically if another platform plugin (e.g. ATOM) has already taken over the backend.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <torch/headeronly/util/shim_utils.h>
+
 #include "scaled_mm_c2x.cuh"
 #include "cutlass/float8.h"
 
@@ -34,10 +36,12 @@ struct sm89_fp8_config_default {
   template <typename InType, typename OutType,
             template <typename, typename> typename Epilogue,
             typename... EpilogueArgs>
-  static void dispatch(torch::Tensor& out, torch::Tensor const& a,
-                       torch::Tensor const& b, EpilogueArgs&&... args) {
+  static void dispatch(torch::stable::Tensor& out,
+                       torch::stable::Tensor const& a,
+                       torch::stable::Tensor const& b, EpilogueArgs&&... args) {
     static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
-    TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
+    STD_TORCH_CHECK(a.scalar_type() ==
+                    torch::headeronly::ScalarType::Float8_e4m3fn);
 
     using FallbackGemm =
         typename sm89_fp8_fallback_gemm<InType, OutType,
@@ -50,7 +54,7 @@ struct sm89_fp8_config_default {
       using TileShape = typename cutlass::gemm::GemmShape<128, 128, 64>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 5, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -58,7 +62,7 @@ struct sm89_fp8_config_default {
       using TileShape = typename cutlass::gemm::GemmShape<256, 128, 64>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 3, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -67,7 +71,7 @@ struct sm89_fp8_config_default {
       using TileShape = typename cutlass::gemm::GemmShape<128, 128, 64>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 5, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -84,10 +88,12 @@ struct sm89_fp8_config_M256 {
   template <typename InType, typename OutType,
             template <typename, typename> typename Epilogue,
             typename... EpilogueArgs>
-  static void dispatch(torch::Tensor& out, torch::Tensor const& a,
-                       torch::Tensor const& b, EpilogueArgs&&... args) {
+  static void dispatch(torch::stable::Tensor& out,
+                       torch::stable::Tensor const& a,
+                       torch::stable::Tensor const& b, EpilogueArgs&&... args) {
     static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
-    TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
+    STD_TORCH_CHECK(a.scalar_type() ==
+                    torch::headeronly::ScalarType::Float8_e4m3fn);
 
     using FallbackGemm =
         typename sm89_fp8_fallback_gemm<InType, OutType,
@@ -100,7 +106,7 @@ struct sm89_fp8_config_M256 {
       using TileShape = typename cutlass::gemm::GemmShape<64, 128, 128>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 3, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -108,7 +114,7 @@ struct sm89_fp8_config_M256 {
       using TileShape = typename cutlass::gemm::GemmShape<128, 128, 64>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 5, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -125,10 +131,12 @@ struct sm89_fp8_config_M128 {
   template <typename InType, typename OutType,
             template <typename, typename> typename Epilogue,
             typename... EpilogueArgs>
-  static void dispatch(torch::Tensor& out, torch::Tensor const& a,
-                       torch::Tensor const& b, EpilogueArgs&&... args) {
+  static void dispatch(torch::stable::Tensor& out,
+                       torch::stable::Tensor const& a,
+                       torch::stable::Tensor const& b, EpilogueArgs&&... args) {
     static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
-    TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
+    STD_TORCH_CHECK(a.scalar_type() ==
+                    torch::headeronly::ScalarType::Float8_e4m3fn);
 
     using FallbackGemm =
         typename sm89_fp8_fallback_gemm<InType, OutType,
@@ -141,7 +149,7 @@ struct sm89_fp8_config_M128 {
       using TileShape = typename cutlass::gemm::GemmShape<64, 128, 128>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 3, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -150,7 +158,7 @@ struct sm89_fp8_config_M128 {
       using TileShape = typename cutlass::gemm::GemmShape<128, 128, 64>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 5, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -158,7 +166,7 @@ struct sm89_fp8_config_M128 {
       using TileShape = typename cutlass::gemm::GemmShape<128, 64, 128>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 3, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -173,10 +181,12 @@ struct sm89_fp8_config_M64 {
   template <typename InType, typename OutType,
             template <typename, typename> typename Epilogue,
             typename... EpilogueArgs>
-  static void dispatch(torch::Tensor& out, torch::Tensor const& a,
-                       torch::Tensor const& b, EpilogueArgs&&... args) {
+  static void dispatch(torch::stable::Tensor& out,
+                       torch::stable::Tensor const& a,
+                       torch::stable::Tensor const& b, EpilogueArgs&&... args) {
     static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
-    TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
+    STD_TORCH_CHECK(a.scalar_type() ==
+                    torch::headeronly::ScalarType::Float8_e4m3fn);
 
     using FallbackGemm =
         typename sm89_fp8_fallback_gemm<InType, OutType,
@@ -191,7 +201,7 @@ struct sm89_fp8_config_M64 {
       using FP8MathOperator = typename cutlass::arch::OpMultiplyAdd;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 5, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -201,7 +211,7 @@ struct sm89_fp8_config_M64 {
       using FP8MathOperator = typename cutlass::arch::OpMultiplyAddFastAccum;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 3, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -211,7 +221,7 @@ struct sm89_fp8_config_M64 {
       using FP8MathOperator = typename cutlass::arch::OpMultiplyAdd;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 5, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -227,10 +237,12 @@ struct sm89_fp8_config_M32 {
   template <typename InType, typename OutType,
             template <typename, typename> typename Epilogue,
             typename... EpilogueArgs>
-  static void dispatch(torch::Tensor& out, torch::Tensor const& a,
-                       torch::Tensor const& b, EpilogueArgs&&... args) {
+  static void dispatch(torch::stable::Tensor& out,
+                       torch::stable::Tensor const& a,
+                       torch::stable::Tensor const& b, EpilogueArgs&&... args) {
     static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
-    TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
+    STD_TORCH_CHECK(a.scalar_type() ==
+                    torch::headeronly::ScalarType::Float8_e4m3fn);
 
     using FallbackGemm =
         typename sm89_fp8_fallback_gemm<InType, OutType,
@@ -244,7 +256,7 @@ struct sm89_fp8_config_M32 {
       using WarpShape = typename cutlass::gemm::GemmShape<16, 64, 64>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 5, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -253,7 +265,7 @@ struct sm89_fp8_config_M32 {
       using WarpShape = typename cutlass::gemm::GemmShape<32, 64, 64>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 4, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -262,7 +274,7 @@ struct sm89_fp8_config_M32 {
       using WarpShape = typename cutlass::gemm::GemmShape<16, 64, 64>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, 5, FP8MathOperator>,
           FallbackGemm>(out, a, b, std::forward<EpilogueArgs>(args)...);
@@ -280,10 +292,12 @@ struct sm89_fp8_config_M16 {
   template <typename InType, typename OutType,
             template <typename, typename> typename Epilogue,
             typename... EpilogueArgs>
-  static void dispatch(torch::Tensor& out, torch::Tensor const& a,
-                       torch::Tensor const& b, EpilogueArgs&&... args) {
+  static void dispatch(torch::stable::Tensor& out,
+                       torch::stable::Tensor const& a,
+                       torch::stable::Tensor const& b, EpilogueArgs&&... args) {
     static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
-    TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
+    STD_TORCH_CHECK(a.scalar_type() ==
+                    torch::headeronly::ScalarType::Float8_e4m3fn);
 
     using FallbackGemm =
         typename sm89_fp8_fallback_gemm<InType, OutType,
@@ -296,7 +310,7 @@ struct sm89_fp8_config_M16 {
       using TileShape = typename cutlass::gemm::GemmShape<16, 64, 128>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, MainLoopStages,
                                 FP8MathOperator>,
@@ -305,7 +319,7 @@ struct sm89_fp8_config_M16 {
       using TileShape = typename cutlass::gemm::GemmShape<16, 128, 64>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, MainLoopStages,
                                 FP8MathOperator>,
@@ -314,7 +328,7 @@ struct sm89_fp8_config_M16 {
       using TileShape = typename cutlass::gemm::GemmShape<32, 64, 128>;
 
       return vllm::fallback_cutlass_gemm_caller<
-          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, vllm::enable_sm89_to_sm90,
+          vllm::cutlass_2x_gemm<cutlass::arch::Sm89, enable_sm89_to_sm90,
                                 InType, OutType, Epilogue, TileShape, WarpShape,
                                 InstructionShape, MainLoopStages,
                                 FP8MathOperator>,
@@ -326,13 +340,15 @@ struct sm89_fp8_config_M16 {
 template <typename InType, typename OutType,
           template <typename, typename> typename Epilogue,
           typename... EpilogueArgs>
-inline void cutlass_gemm_sm89_fp8_dispatch(torch::Tensor& out,
-                                           torch::Tensor const& a,
-                                           torch::Tensor const& b,
+inline void cutlass_gemm_sm89_fp8_dispatch(torch::stable::Tensor& out,
+                                           torch::stable::Tensor const& a,
+                                           torch::stable::Tensor const& b,
                                            EpilogueArgs&&... args) {
   static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
-  TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
-  TORCH_CHECK(b.dtype() == torch::kFloat8_e4m3fn);
+  STD_TORCH_CHECK(a.scalar_type() ==
+                  torch::headeronly::ScalarType::Float8_e4m3fn);
+  STD_TORCH_CHECK(b.scalar_type() ==
+                  torch::headeronly::ScalarType::Float8_e4m3fn);
 
   uint32_t const m = a.size(0);
   uint32_t const mp2 =
@@ -362,6 +378,45 @@ inline void cutlass_gemm_sm89_fp8_dispatch(torch::Tensor& out,
     // M in (256, inf)
     return sm89_fp8_config_default::dispatch<InType, OutType, Epilogue>(
         out, a, b, std::forward<EpilogueArgs>(args)...);
+  }
+}
+
+template <typename InType, typename OutType,
+          template <typename, typename> typename Epilogue,
+          typename... EpilogueArgs>
+inline void cutlass_gemm_sm89_fp8_batch_invariant_dispatch(
+    torch::stable::Tensor& out, torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b, EpilogueArgs&&... args) {
+  static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
+  STD_TORCH_CHECK(a.scalar_type() ==
+                  torch::headeronly::ScalarType::Float8_e4m3fn);
+  STD_TORCH_CHECK(b.scalar_type() ==
+                  torch::headeronly::ScalarType::Float8_e4m3fn);
+
+  // keep the CUTLASS config independent of M for batch invariance
+  return sm89_fp8_config_M64::dispatch<InType, OutType, Epilogue>(
+      out, a, b, std::forward<EpilogueArgs>(args)...);
+}
+
+template <template <typename, typename> typename Epilogue,
+          typename... EpilogueArgs>
+void cutlass_scaled_mm_sm89_fp8_batch_invariant_epilogue(
+    torch::stable::Tensor& out, torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b, EpilogueArgs&&... epilogue_args) {
+  STD_TORCH_CHECK(a.scalar_type() ==
+                  torch::headeronly::ScalarType::Float8_e4m3fn);
+  STD_TORCH_CHECK(b.scalar_type() ==
+                  torch::headeronly::ScalarType::Float8_e4m3fn);
+
+  if (out.scalar_type() == torch::headeronly::ScalarType::BFloat16) {
+    return cutlass_gemm_sm89_fp8_batch_invariant_dispatch<
+        cutlass::float_e4m3_t, cutlass::bfloat16_t, Epilogue>(
+        out, a, b, std::forward<EpilogueArgs>(epilogue_args)...);
+  } else {
+    STD_TORCH_CHECK(out.scalar_type() == torch::headeronly::ScalarType::Half);
+    return cutlass_gemm_sm89_fp8_batch_invariant_dispatch<
+        cutlass::float_e4m3_t, cutlass::half_t, Epilogue>(
+        out, a, b, std::forward<EpilogueArgs>(epilogue_args)...);
   }
 }
 

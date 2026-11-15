@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
-import torch
 from transformers import AutoTokenizer
 
 from tests.v1.engine.utils import (
+    FULL_STRINGS,
     NUM_PROMPT_LOGPROBS_UNDER_TEST,
     NUM_SAMPLE_LOGPROBS_UNDER_TEST,
     PROMPT_LEN,
@@ -18,19 +18,14 @@ from vllm.engine.arg_utils import EngineArgs
 
 from ...distributed.conftest import publisher_config, random_port  # noqa: F401
 
-from tests.v1.engine.utils import FULL_STRINGS  # isort: skip
-
-EngineCoreSampleLogprobsType = list[tuple[torch.Tensor, torch.Tensor]]
-EngineCorePromptLogprobsType = tuple[torch.Tensor, torch.Tensor]
-
 
 def _build_test_vectors_no_logprobs() -> DummyOutputProcessorTestVectors:
-    """Generate output processor dummy test vectors, without logprobs
+    """Generate output processor dummy test vectors, without logprobs.
 
     Returns:
       DummyOutputProcessorTestVectors instance with no logprobs
-    """
 
+    """
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     vllm_config = EngineArgs(model=TOKENIZER_NAME).create_engine_config()
     # Tokenize prompts under test & create dummy generated tokens
@@ -63,10 +58,11 @@ def _build_test_vectors_no_logprobs() -> DummyOutputProcessorTestVectors:
 
 @pytest.fixture
 def dummy_test_vectors() -> DummyOutputProcessorTestVectors:
-    """Generate output processor dummy test vectors, with logprobs
+    """Generate output processor dummy test vectors, with logprobs.
 
     Returns:
       DummyOutputProcessorTestVectors instance with logprobs
+
     """
     # Build dummy test vectors without logprobs
     dtv = _build_test_vectors_no_logprobs()

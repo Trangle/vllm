@@ -9,9 +9,9 @@ Note: these tests will only pass on L4 GPU.
 import pytest
 
 from tests.quantization.utils import is_quant_method_supported
+from vllm.v1.attention.backends.fa_utils import flash_attn_supports_kv_cache_dtype
 from vllm.platforms import current_platform
-from vllm.utils import STR_BACKEND_ENV_VAR
-
+from vllm.utils.flashinfer import has_flashinfer
 from ..utils import check_logprobs_close
 
 
@@ -45,7 +45,9 @@ from ..utils import check_logprobs_close
 # Due to low-precision numerical divergence, we only test logprob of 4 tokens
 @pytest.mark.parametrize("max_tokens", [4])
 @pytest.mark.parametrize("enforce_eager", [True])
-@pytest.mark.parametrize("backend", ["FLASH_ATTN"])
+@pytest.mark.parametrize(
+    "backend", [None] if current_platform.is_rocm() else ["FLASH_ATTN"]
+)
 # NOTE: Increasing this in this suite will fail CI because we currently cannot
 # reset distributed env properly. Use a value > 1 just when you test.
 @pytest.mark.parametrize("tensor_parallel_size", [1])
@@ -68,13 +70,18 @@ def test_models(
 
     if kv_cache_dtype == "fp8_e5m2" and current_platform.is_rocm():
         pytest.skip(f"{kv_cache_dtype} is currently not supported on ROCm/HIP.")
+    if kv_cache_dtype == "fp8_e5m2" and current_platform.is_cuda():
+        pytest.skip(f"{kv_cache_dtype} is not supported by FLASH_ATTN on CUDA.")
 
-    if not current_platform.is_kv_cache_dtype_supported(kv_cache_dtype, None):
-        pytest.skip(f"{kv_cache_dtype} is not supported on this platform.")
+    if backend == "FLASH_ATTN" and not flash_attn_supports_kv_cache_dtype(
+        kv_cache_dtype
+    ):
+        pytest.skip(
+            f"{kv_cache_dtype} is not supported on this GPU type with {backend} attention."
+        )
 
     with monkeypatch.context() as m:
         m.setenv("TOKENIZERS_PARALLELISM", "true")
-        m.setenv(STR_BACKEND_ENV_VAR, backend)
 
         MAX_MODEL_LEN = 1024
         NUM_LOG_PROBS = 8
@@ -85,6 +92,7 @@ def test_models(
             tensor_parallel_size=tensor_parallel_size,
             enforce_eager=enforce_eager,
             kv_cache_dtype="auto",
+            attention_config={"backend": backend},
         ) as vllm_model:
             baseline_outputs = vllm_model.generate_greedy_logprobs(
                 example_prompts, max_tokens, NUM_LOG_PROBS
@@ -96,6 +104,7 @@ def test_models(
             tensor_parallel_size=tensor_parallel_size,
             enforce_eager=enforce_eager,
             kv_cache_dtype=kv_cache_dtype,
+            attention_config={"backend": backend},
         ) as vllm_model:
             test_outputs = vllm_model.generate_greedy_logprobs(
                 example_prompts, max_tokens, NUM_LOG_PROBS
@@ -107,6 +116,37 @@ def test_models(
             name_0="fp16_kv_cache",
             name_1="fp8_kv_cache",
         )
+
+
+@pytest.mark.skipif(not has_flashinfer(), reason="FlashInfer is not available.")
+@pytest.mark.parametrize("max_tokens", [4])
+def test_flashinfer_bf16_query_with_checkpoint_q_scale(
+    vllm_runner, example_prompts, max_tokens: int
+) -> None:
+    """A checkpoint q_scale must not descale a BF16 query in FlashInfer."""
+    # Unquantized weights with a per-layer self_attn.q_scale of about 0.03.
+    model = "nm-testing/TinyLlama-1.1B-Chat-v1.0-kvcache-fp8-tensor"
+    outputs = []
+    for attention_config in (
+        {"backend": "TRITON_ATTN"},
+        {"backend": "FLASHINFER", "disable_flashinfer_q_quantization": True},
+    ):
+        with vllm_runner(
+            model,
+            max_model_len=1024,
+            enforce_eager=True,
+            kv_cache_dtype="fp8",
+            attention_config=attention_config,
+        ) as vllm_model:
+            outputs.append(
+                vllm_model.generate_greedy_logprobs(example_prompts, max_tokens, 8)
+            )
+    check_logprobs_close(
+        outputs_0_lst=outputs[0],
+        outputs_1_lst=outputs[1],
+        name_0="triton",
+        name_1="flashinfer",
+    )
 
 
 @pytest.mark.cpu_model

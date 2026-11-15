@@ -16,11 +16,11 @@ import torch
 from torch import nn
 from transformers import Zamba2Config
 
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import GeluAndMul
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -32,17 +32,17 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
+    MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import HasInnerState, IsHybrid
@@ -71,18 +71,36 @@ class Zamba2LoRA(nn.Module):
             rank: LoRA rank
             output_dim: output dimension
             quant_config: Configuration for model quantization
+            prefix: Module prefix used for quantization config lookup
+
         """
         super().__init__()
 
         self.A = ColumnParallelLinear(
-            input_dim, rank, bias=False, quant_config=quant_config, gather_output=True
+            input_dim,
+            rank,
+            bias=False,
+            quant_config=quant_config,
+            gather_output=True,
+            prefix=f"{prefix}.A",
         )
 
         if isinstance(output_dim, list):
-            B_class = MergedColumnParallelLinear
+            self.B: ColumnParallelLinear = MergedColumnParallelLinear(
+                rank,
+                output_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.B",
+            )
         else:
-            B_class = ColumnParallelLinear
-        self.B = B_class(rank, output_dim, bias=False, quant_config=quant_config)
+            self.B = ColumnParallelLinear(
+                rank,
+                output_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.B",
+            )
 
     def forward(
         self,
@@ -119,12 +137,12 @@ class Zamba2Attention(nn.Module):
             cache_config: Configuration for key-value caching
             quant_config: Configuration for model quantization
             prefix: Optional prefix for parameter names
+
         """
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
         self.config = config
         self.num_hybrid_layers = num_hybrid_layers
-        self.rope_theta = config.rope_theta
 
         self.attention_hidden_size = config.attention_hidden_size
         self.total_num_attention_heads = config.num_attention_heads
@@ -150,12 +168,14 @@ class Zamba2Attention(nn.Module):
             self.total_num_attention_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.attention_hidden_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
         )
 
         # Even though in Zamba2 weights are shared between attention layers, KV
@@ -197,18 +217,21 @@ class Zamba2Attention(nn.Module):
                         config.adapter_rank,
                         self.attention_hidden_size,
                         quant_config=quant_config,
+                        prefix=f"{prefix}.linear_q_adapter",
                     )
                     linear_k_adapter = Zamba2LoRA(
                         self.attention_hidden_size,
                         config.adapter_rank,
                         self.attention_hidden_size,
                         quant_config=quant_config,
+                        prefix=f"{prefix}.linear_k_adapter",
                     )
                     linear_v_adapter = Zamba2LoRA(
                         self.attention_hidden_size,
                         config.adapter_rank,
                         self.attention_hidden_size,
                         quant_config=quant_config,
+                        prefix=f"{prefix}.linear_v_adapter",
                     )
                 else:
                     linear_q_adapter = nn.Identity()
@@ -222,10 +245,8 @@ class Zamba2Attention(nn.Module):
         if config.use_mem_rope:
             self.rotary_emb = get_rope(
                 head_size=self.attention_head_dim,
-                rotary_dim=self.attention_head_dim,
                 max_position=config.max_position_embeddings,
-                base=self.rope_theta,
-                rope_scaling=None,
+                rope_parameters=config.rope_parameters,
                 is_neox_style=True,
             )
 
@@ -244,6 +265,7 @@ class Zamba2Attention(nn.Module):
 
         Returns:
             Output tensor [batch_size, seq_len, hidden_size]
+
         """
         qkv, _ = self.qkv_proj(hidden_states)
         query_states, key_states, value_states = qkv.split([self.qkv_size] * 3, dim=-1)
@@ -287,7 +309,7 @@ class Zamba2MLP(nn.Module):
         self,
         config: Zamba2Config,
         bare_block_idx: int,
-        num_hybrid_layers: dict[int, int],
+        num_hybrid_layers: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -298,6 +320,8 @@ class Zamba2MLP(nn.Module):
             bare_block_idx: Index of the bare block in the model
             num_hybrid_layers: Total number of hybrid layers
             quant_config: Configuration for model quantization
+            prefix: Module prefix used for quantization config lookup
+
         """
         super().__init__()
         self.config = config
@@ -312,6 +336,7 @@ class Zamba2MLP(nn.Module):
             2 * [self.intermediate_size],  # 2x for gate and input projections
             bias=self.config.add_bias_linear,
             quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
 
         self.down_proj = RowParallelLinear(
@@ -319,6 +344,7 @@ class Zamba2MLP(nn.Module):
             self.hidden_size,
             bias=self.config.add_bias_linear,
             quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
 
         # Only allow GELU activations
@@ -338,6 +364,7 @@ class Zamba2MLP(nn.Module):
                     config.adapter_rank,
                     2 * [self.intermediate_size],
                     quant_config,
+                    prefix=f"{prefix}.gate_up_proj_adapter_list.{block_idx}",
                 )
             else:
                 gate_up_proj_adapter = nn.Identity()
@@ -353,6 +380,7 @@ class Zamba2MLP(nn.Module):
         Returns:
             Output tensor [batch_size, seq_len, hidden_size] after applying
             gated feed-forward transformation
+
         """
         # Project input to intermediate size with gating
         gate_up_states, _ = self.gate_up_proj(hidden_states)
@@ -399,6 +427,7 @@ class Zamba2AttentionDecoderLayer(nn.Module):
             cache_config: Configuration for key-value caching
             quant_config: Configuration for model quantization
             prefix: Optional prefix for parameter names
+
         """
         super().__init__()
 
@@ -418,6 +447,7 @@ class Zamba2AttentionDecoderLayer(nn.Module):
             bare_block_idx=bare_block_idx,
             num_hybrid_layers=num_hybrid_layers,
             quant_config=quant_config,
+            prefix=f"{prefix}.feed_forward",
         )
 
         # Initialize layer normalizations
@@ -444,8 +474,8 @@ class Zamba2AttentionDecoderLayer(nn.Module):
 
         Returns:
             Transformed hidden states after attention and feed-forward
-        """
 
+        """
         # The argument original_hidden_states is concatenated with hidden_states
         # (which is the output of the previous (mamba) layer).
         # The concatenated tensor is then used as input of the pre-attention
@@ -493,7 +523,11 @@ class Zamba2MambaDecoderLayer(nn.Module):
 
         Args:
             config: The Zamba2 model configuration
+            model_config: The model config, when available
+            cache_config: The KV cache config, when available
             quant_config: Configuration for model quantization
+            prefix: Module prefix used for quantization config lookup
+
         """
         super().__init__()
 
@@ -538,6 +572,7 @@ class Zamba2MambaDecoderLayer(nn.Module):
 
         Returns:
             Transformed hidden states with residual connection applied
+
         """
         # Store input for residual connection
         residual = hidden_states
@@ -555,11 +590,7 @@ class Zamba2MambaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Process through Mamba mixer
-        output = torch.empty_like(hidden_states)
-        self.mamba(
-            hidden_states,
-            output,
-        )
+        output = self.mamba(hidden_states)
 
         # residual connection after mamba
         hidden_states = residual + output
@@ -590,6 +621,13 @@ class Zamba2HybridLayer(nn.Module):
 
         Args:
             shared_transformer: Transformer decoder layer for attention pathway
+            config: The Zamba2 model configuration
+            block_idx: Index of this hybrid block in the model
+            model_config: The model config, when available
+            cache_config: The KV cache config, when available
+            quant_config: Configuration for model quantization
+            prefix: Module prefix used for quantization config lookup
+
         """
         super().__init__()
         self.block_idx = block_idx
@@ -599,6 +637,7 @@ class Zamba2HybridLayer(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.linear",
         )
         self.mamba_decoder = Zamba2MambaDecoderLayer(
             config,
@@ -630,6 +669,7 @@ class Zamba2HybridLayer(nn.Module):
 
         Returns:
             Output tensor combining transformer and Mamba representations
+
         """
         # Process through transformer pathway
         transformer_hidden_states = self.shared_transformer(
@@ -666,6 +706,7 @@ class Zamba2Model(nn.Module):
             vllm_config: Configuration object containing model, cache,
                 quantization and LoRA settings
             prefix: Optional prefix for parameter names in state dict
+
         """
         super().__init__()
 
@@ -673,24 +714,15 @@ class Zamba2Model(nn.Module):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
-        is_lora_enabled = bool(lora_config)
-        assert not is_lora_enabled
 
         self.config = config
-        lora_vocab = (
-            (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1))
-            if lora_config
-            else 0
-        )
-        self.vocab_size = config.vocab_size + lora_vocab
-        self.org_vocab_size = config.vocab_size
+
+        self.vocab_size = config.vocab_size
 
         # Initialize token embeddings
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
-            org_num_embeddings=config.vocab_size,
         )
 
         # Map hybrid layer indices to block indices
@@ -749,7 +781,7 @@ class Zamba2Model(nn.Module):
         # Final layer normalization
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Convert input token IDs to embeddings.
 
         Args:
@@ -757,12 +789,13 @@ class Zamba2Model(nn.Module):
 
         Returns:
             Embedded representation of the input tokens
+
         """
         return self.embed_tokens(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
@@ -776,15 +809,16 @@ class Zamba2Model(nn.Module):
         Returns:
             Either final hidden states or intermediate tensors for pipeline
             parallelism
+
         """
         # Handle pipeline parallelism for first rank
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings(input_ids)
+            inputs_embeds = self.embed_input_ids(input_ids)
         hidden_states = inputs_embeds
 
         # Process through layers
         original_hidden_states = torch.clone(hidden_states)
-        for layer_idx, layer in enumerate(self.layers):
+        for layer in self.layers:
             layer_outputs = layer(
                 hidden_states,
                 original_hidden_states=original_hidden_states,
@@ -794,34 +828,6 @@ class Zamba2Model(nn.Module):
 
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for chkpt_weight_name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in chkpt_weight_name:
-                    continue
-                chkpt_weight_name = chkpt_weight_name.replace(weight_name, param_name)
-                param = params_dict[chkpt_weight_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if chkpt_weight_name not in params_dict:
-                    continue
-                param = params_dict[chkpt_weight_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(chkpt_weight_name)
-        return loaded_params
 
 
 class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
@@ -840,7 +846,12 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
             "A_log": "A",
             "0.weight": "A.weight",
             "1.weight": "B.weight",
-        }
+        },
+        orig_to_new_stacked={
+            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
+            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
+            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
+        },
     )
 
     @classmethod
@@ -868,8 +879,8 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
             Tuple containing:
             - conv_state_shape: Shape for convolutional state cache
             - temporal_state_shape: Shape for state space model cache
-        """
 
+        """
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_config
         intermediate_size = hf_config.mamba_expand * hf_config.hidden_size
@@ -882,7 +893,12 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
             head_dim=hf_config.mamba_headdim,
             state_size=hf_config.mamba_d_state,
             conv_kernel=hf_config.mamba_d_conv,
+            num_spec=vllm_config.num_speculative_tokens,
         )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.mamba2_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         """Initialize the Zamba2 model for causal language modeling.
@@ -892,12 +908,9 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
                         LoRA and scheduler settings
             prefix: Optional prefix for parameter names
 
-        Raises:
-            AssertionError: If prefix caching is enabled
-                (not supported by Mamba)
         """
         config = vllm_config.model_config.hf_config
-        lora_config = vllm_config.lora_config
+
         scheduler_config = vllm_config.scheduler_config
 
         super().__init__()
@@ -905,9 +918,6 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.vllm_config = vllm_config
         self.scheduler_config = scheduler_config
         self.model_config = vllm_config.model_config
-        self.unpadded_vocab_size = config.vocab_size
-        if lora_config:
-            self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
 
         # Initialize core model
         self.model = Zamba2Model(
@@ -916,36 +926,30 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
         # Initialize language modeling head
         self.lm_head = ParallelLMHead(
-            self.unpadded_vocab_size,
+            config.vocab_size,
             config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            padding_size=DEFAULT_VOCAB_PADDING_SIZE
-            # We need bigger padding if using lora for kernel
-            # compatibility
-            if not lora_config
-            else lora_config.lora_vocab_padding_size,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         # Tie weights with input embeddings if using same dimensions
         self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
         # Initialize logits processing and sampling
-        self.logits_processor = LogitsProcessor(
-            self.unpadded_vocab_size, config.vocab_size
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Convert input token IDs to embeddings.
+
         Args:
             input_ids: Tensor of input token IDs
         Returns:
             Embedded representation of the input tokens
+
         """
-        return self.model.get_input_embeddings(input_ids)
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
@@ -960,6 +964,7 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
         Returns:
             Output hidden states
+
         """
         # Forward pass through model
         hidden_states = self.model(
@@ -981,6 +986,7 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
         Returns:
             Logits for next token prediction
+
         """
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits

@@ -4,6 +4,10 @@
 
 The architecture is the same as granitemoe but with the addition of shared
 experts.
+
+Also serves the `granitemoe_swa` checkpoints (`GraniteMoeSWAForCausalLM`), which
+add the same per-layer sliding window, attention sink and per-layer RoPE support
+as `granite_swa` (see `granite.py`).
 """
 
 from collections.abc import Iterable
@@ -25,14 +29,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.sequence import IntermediateTensors
 
 from .granitemoe import GraniteMoeAttention, GraniteMoeModel, GraniteMoeMoE
-from .interfaces import SupportsLoRA, SupportsPP
+from .interfaces import EagleModelMixin, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import AutoWeightsLoader, make_layers, maybe_prefix
 
 
@@ -85,16 +88,12 @@ class GraniteMoeSharedDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Requires transformers > 4.32.0
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
         self.self_attn = GraniteMoeAttention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
             num_kv_heads=config.num_key_value_heads,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
@@ -152,30 +151,22 @@ class GraniteMoeSharedDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class GraniteMoeSharedModel(nn.Module):
+class GraniteMoeSharedModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
 
         self.config = config
         self.quant_config = quant_config  # Required by MixtralModel
-        self.padding_idx = config.pad_token_id
-        lora_vocab = (
-            (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1))
-            if lora_config
-            else 0
-        )
-        self.vocab_size = config.vocab_size + lora_vocab
-        self.org_vocab_size = config.vocab_size
+
+        self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
-            org_num_embeddings=config.vocab_size,
             quant_config=quant_config,
         )
         self.embedding_multiplier = config.embedding_multiplier
@@ -190,27 +181,33 @@ class GraniteMoeSharedModel(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
+                hidden_states = self.embed_input_ids(input_ids)
             hidden_states *= self.embedding_multiplier
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, None)
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
             hidden_states = layer(positions, hidden_states)
+            self._maybe_add_hidden_state(
+                aux_hidden_states, idx + 1, hidden_states, None
+            )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {
@@ -218,48 +215,16 @@ class GraniteMoeSharedModel(nn.Module):
                 }
             )
         hidden_states = self.norm(hidden_states)
+
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        new_weights = {}
-        for n, p in weights:
-            if n.endswith(".block_sparse_moe.input_linear.weight"):
-                for e in range(p.size(0)):
-                    w1_name = n.replace(
-                        ".block_sparse_moe.input_linear.weight",
-                        f".block_sparse_moe.experts.{e}.w1.weight",
-                    )
-                    w3_name = n.replace(
-                        ".block_sparse_moe.input_linear.weight",
-                        f".block_sparse_moe.experts.{e}.w3.weight",
-                    )
-                    w1_param, w3_param = p[e].chunk(2, dim=0)
-                    assert w1_name not in new_weights
-                    assert w3_name not in new_weights
-                    new_weights[w1_name] = w1_param
-                    new_weights[w3_name] = w3_param
-            elif n.endswith(".block_sparse_moe.output_linear.weight"):
-                for e in range(p.size(0)):
-                    w2_name = n.replace(
-                        ".block_sparse_moe.output_linear.weight",
-                        f".block_sparse_moe.experts.{e}.w2.weight",
-                    )
-                    w2_param = p[e]
-                    assert w2_name not in new_weights
-                    new_weights[w2_name] = w2_param
-            elif n.endswith(".block_sparse_moe.router.layer.weight"):
-                gate_name = n.replace(
-                    ".block_sparse_moe.router.layer.weight",
-                    ".block_sparse_moe.gate.weight",
-                )
-                assert gate_name not in new_weights
-                new_weights[gate_name] = p
-            else:
-                new_weights[n] = p
-        return GraniteMoeModel._load_weights(self, new_weights.items())
+    hf_to_vllm_mapper = GraniteMoeModel.hf_to_vllm_mapper
+    load_weights = GraniteMoeModel.load_weights
 
 
-class GraniteMoeSharedForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+class GraniteMoeSharedForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     fall_back_to_pt_during_load = False
 
     packed_modules_mapping = {
@@ -275,50 +240,39 @@ class GraniteMoeSharedForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         "embed_tokens": "input_embeddings",
         "lm_head": "output_embeddings",
     }
-    embedding_padding_modules = ["lm_head"]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
 
         self.config = config
-        self.lora_config = lora_config
 
         self.model = GraniteMoeSharedModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.unpadded_vocab_size = config.vocab_size
-        if lora_config:
-            self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+
         self.lm_head = ParallelLMHead(
-            self.unpadded_vocab_size,
+            config.vocab_size,
             config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            padding_size=DEFAULT_VOCAB_PADDING_SIZE
-            # We need bigger padding if using lora for kernel
-            # compatibility
-            if not lora_config
-            else lora_config.lora_vocab_padding_size,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
         self.logits_processor = LogitsProcessor(
-            self.unpadded_vocab_size,
+            config.vocab_size,
             config.vocab_size,
             scale=1 / self.config.logits_scaling,
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -344,8 +298,5 @@ class GraniteMoeSharedForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

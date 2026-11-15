@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import hashlib
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+import os
+from typing import TYPE_CHECKING, Any, Literal, Self
 
 import torch
 from pydantic import ConfigDict, Field, model_validator
-from pydantic.dataclasses import dataclass
-from typing_extensions import Self
 
-import vllm.envs as envs
-from vllm.config.utils import config
+from vllm import envs
+from vllm.config.kernel import MEGA_MOE_BACKENDS, KernelConfig
+from vllm.config.utils import CompileFactors, config, get_compile_factors
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -25,11 +24,9 @@ logger = init_logger(__name__)
 
 LoRADType = Literal["auto", "float16", "bfloat16"]
 MaxLoRARanks = Literal[1, 8, 16, 32, 64, 128, 256, 320, 512]
-LoRAExtraVocabSize = Literal[256, 512]
 
 
-@config
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+@config(config=ConfigDict(arbitrary_types_allowed=True))
 class LoRAConfig:
     """Configuration for LoRA."""
 
@@ -47,19 +44,10 @@ class LoRAConfig:
     `max_loras`."""
     lora_dtype: torch.dtype | LoRADType = "auto"
     """Data type for LoRA. If auto, will default to base model dtype."""
-    lora_extra_vocab_size: LoRAExtraVocabSize = Field(
-        default=256,
-        deprecated=(
-            "`lora_extra_vocab_size` is deprecated and will be removed "
-            "in v0.12.0. Additional vocabulary support for "
-            "LoRA adapters is being phased out."
-        ),
-    )
-    """(Deprecated) Maximum size of extra vocabulary that can be present in a 
-    LoRA adapter. Will be removed in v0.12.0."""
-    lora_vocab_padding_size: ClassVar[int] = (
-        current_platform.get_lora_vocab_padding_size()
-    )
+    target_modules: list[str] | None = None
+    """Restrict LoRA to specific module suffixes (e.g., ["o_proj", "qkv_proj"]).
+    If None, all supported LoRA modules are used. This allows deployment-time
+    control over which modules have LoRA applied, useful for performance tuning."""
     default_mm_loras: dict[str, str] | None = None
     """Dictionary mapping specific modalities to LoRA model paths; this field
     is only applicable to multimodal models and should be leveraged when a
@@ -70,12 +58,38 @@ class LoRAConfig:
     per prompt. When run in offline mode, the lora IDs for n modalities
     will be automatically assigned to 1-n with the names of the modalities
     in alphabetic order."""
+    enable_tower_connector_lora: bool = False
+    """If `True`, LoRA support for the tower (vision encoder) and connector 
+    of multimodal models will be enabled. This is an experimental feature and 
+    currently only supports some MM models such as the Qwen VL series. The default 
+    is False."""
+    specialize_active_lora: bool = False
+    """Whether to construct lora kernel grid by the number of active LoRA adapters.
+    When set to True, separate cuda graphs will be captured for different counts
+    of active LoRAs (powers of 2 up to max_loras), which can improve performance
+    for variable LoRA usage patterns at the cost of increased startup time and
+    memory usage. Only takes effect when cudagraph_specialize_lora is True.
+    """
+    enable_mixed_moe_lora_format: bool = False
+    """If True, force the engine to use the universal 2D MoE LoRA wrapper
+    (`FusedMoEWithLoRA`) regardless of the model's `is_3d_moe_weight` flag, so
+    that 2D-format and 3D-format MoE LoRA adapters can be served in the same
+    deployment. Only meaningful for MoE models; ignored otherwise. Default False
+    keeps the existing model-driven behavior."""
+    enable_moe_shared_loras: bool = False
+    """If True, load MoE expert adapters in the "shared-outer" layout, where the
+    gate/up (`w1`/`w3`) lora_A and the down (`w2`) lora_B are shared across all
+    experts (stored once with expert-dim 1) instead of per-expert. The shared
+    factors are broadcast to the expert count at kernel time. 3D-weight MoE
+    models use `FusedMoEWithLoRA` for this layout. Only meaningful for MoE
+    models whose adapters use this layout; ignored otherwise."""
+    max_lora_cls_labels: int | None = Field(default=None, ge=1)
+    """Maximum output size for LoRA classification heads. Defaults to the
+    base classification head size."""
 
-    def compute_hash(self) -> str:
-        """
-        WARNING: Whenever a new field is added to this config,
-        ensure that it is included in the factors list if
-        it affects the computation graph.
+    def compile_factors(self) -> CompileFactors:
+        """WARNING: Whenever a new field is added to this config, add it to
+        `ignored_factors` if it does not affect the computation graph.
 
         Provide a hash that uniquely identifies all the configs
         that affect the structure of the computation
@@ -83,16 +97,17 @@ class LoRAConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        factors: list[Any] = []
-        factors.append(self.max_lora_rank)
-        factors.append(self.max_loras)
-        factors.append(self.fully_sharded_loras)
-        factors.append(self.lora_dtype)
-        factors.append(self.lora_extra_vocab_size)
-        factors.append(self.lora_vocab_padding_size)
-
-        hash_str = hashlib.md5(str(factors).encode(), usedforsecurity=False).hexdigest()
-        return hash_str
+        ignored_factors = {
+            # Runtime/placement only; does not affect compiled graph
+            "max_cpu_loras",
+            "default_mm_loras",
+            "specialize_active_lora",
+        }
+        factors = get_compile_factors(self, ignored_factors)
+        if self.target_modules is not None:
+            # Order is not semantic
+            factors["target_modules"] = sorted(self.target_modules)
+        return factors
 
     @model_validator(mode="after")
     def _validate_lora_config(self) -> Self:
@@ -101,17 +116,48 @@ class LoRAConfig:
         elif self.max_cpu_loras < self.max_loras:
             raise ValueError(
                 f"max_cpu_loras ({self.max_cpu_loras}) must be >= "
-                f"max_loras ({self.max_loras})"
+                f"max_loras ({self.max_loras})."
             )
-
+        if envs.VLLM_LORA_ENABLE_DUAL_STREAM and not current_platform.is_cuda_alike():
+            raise ValueError("Dual CUDA streams are only supported on CUDA platforms.")
+        if envs.VLLM_LORA_ENABLE_DUAL_STREAM and self.fully_sharded_loras:
+            logger.warning_once(
+                "fully_sharded_loras isn't compatible with "
+                "VLLM_LORA_ENABLE_DUAL_STREAM, set VLLM_LORA_ENABLE_DUAL_STREAM=False"
+            )
+            envs.VLLM_LORA_ENABLE_DUAL_STREAM = False
         return self
 
-    def verify_with_cache_config(self, cache_config: CacheConfig):
-        if cache_config.cpu_offload_gb > 0 and not envs.VLLM_USE_V1:
-            raise ValueError("V0 LoRA does not support CPU offload, please use V1.")
+    def verify_with_kernel_config(self, kernel_config: KernelConfig) -> None:
+        """Reject MegaMoE backends, which do not support LoRA."""
+        moe_backend = kernel_config.moe_backend
+        if moe_backend in MEGA_MOE_BACKENDS or moe_backend == "aiter_mega_moe":
+            raise ValueError(
+                f"LoRA is not supported with moe_backend={moe_backend!r}. "
+                "Disable LoRA or select a MoE backend that supports LoRA."
+            )
 
     def verify_with_model_config(self, model_config: ModelConfig):
+        # Speculative decoding drafters don't run LoRA adapters.
+        if model_config.runner_type != "draft" and not model_config.is_lora_supported:
+            raise ValueError(
+                f"LoRA is not supported for {model_config.architecture} "
+                f"({model_config.model}). Supported models implement the "
+                "`SupportsLoRA` interface. Run this model without "
+                "`enable_lora`."
+            )
+
         if self.lora_dtype in (None, "auto"):
             self.lora_dtype = model_config.dtype
         elif isinstance(self.lora_dtype, str):
             self.lora_dtype = getattr(torch, self.lora_dtype)
+
+        architectures = getattr(model_config, "architectures", None) or []
+        is_inkling = any("Inkling" in arch for arch in architectures)
+        if is_inkling and os.environ.get("INKLING_MULTIMEM_AR", "1") != "0":
+            raise ValueError(
+                "Inkling LoRA requires INKLING_MULTIMEM_AR=0: the Lamport "
+                "fused-collective path bypasses the LoRA-wrapped wo_ud and dense "
+                "down_proj layers on decode-sized batches, silently dropping "
+                "their LoRA. Set INKLING_MULTIMEM_AR=0."
+            )

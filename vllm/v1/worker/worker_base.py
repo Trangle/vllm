@@ -1,32 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
 import torch.nn as nn
 
+import vllm.ir
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed.kv_transfer.kv_connector.utils import get_current_attn_backends
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import worker_receiver_cache_from_config
-from vllm.utils import (
-    enable_trace_function_call_for_thread,
-    resolve_obj_by_qualname,
-    run_method,
-    update_environment_variables,
-    warn_for_unimplemented_methods,
+from vllm.tracing import instrument
+from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.system_utils import update_environment_variables
+from vllm.v1.attention.backends.utils import (
+    get_supported_kv_cache_layouts,
+    record_kv_cache_layout,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 else:
     SchedulerOutput = object
+    GrammarOutput = object
+    AsyncModelRunnerOutput = object
     ModelRunnerOutput = object
 
 logger = init_logger(__name__)
@@ -34,7 +36,14 @@ logger = init_logger(__name__)
 _R = TypeVar("_R")
 
 
-@warn_for_unimplemented_methods
+class CompilationTimes(NamedTuple):
+    language_model: float
+    encoder: float
+    num_kv_blocks: int | None = None
+    """KV cache blocks that fit in the memory measured after warmup, reported
+    by workers with an extensible KV cache."""
+
+
 class WorkerBase:
     """Worker interface that allows vLLM to cleanly separate implementations for
     different hardware. Also abstracts control plane communication, e.g., to
@@ -49,8 +58,7 @@ class WorkerBase:
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ) -> None:
-        """
-        Initialize common worker components.
+        """Initialize common worker components.
 
         Args:
             vllm_config: Complete vLLM configuration
@@ -59,6 +67,7 @@ class WorkerBase:
             distributed_init_method: Distributed initialization method
             is_driver_worker: Whether this worker handles driver
                 responsibilities
+
         """
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -87,17 +96,63 @@ class WorkerBase:
         self.device: torch.device | None = None
         self.model_runner: nn.Module | None = None
 
-    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        # IR op priority and torch-wrap state are constant for the worker's
+        # lifetime.
+        vllm_config.kernel_config.ir_op_priority.set_default()
+        vllm.ir.set_default_torch_wrap(
+            vllm_config.compilation_config.ir_enable_torch_wrap
+        )
+
+    def get_kv_cache_layer_configs(self) -> dict[str, KVCacheLayerConfig]:
         """Get specifications for KV cache implementation."""
         raise NotImplementedError
 
-    def compile_or_warm_up_model(self) -> None:
-        """Prepare model for execution through compilation/warmup."""
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        """Layout names every attention backend supports, most preferred first."""
+        backends = get_current_attn_backends(self.vllm_config)
+        return [layout.name for layout in get_supported_kv_cache_layouts(backends)]
+
+    def set_kv_cache_layout(
+        self, kv_cache_layout: str, cp_kv_cache_interleave_size: int
+    ) -> None:
+        """Assign the KV cache layout and CP interleave size resolved by the core."""
+        record_kv_cache_layout(self.vllm_config.cache_config, kv_cache_layout)
+        self.vllm_config.parallel_config.cp_kv_cache_interleave_size = (
+            cp_kv_cache_interleave_size
+        )
+
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        """Prepare model for execution through compilation/warmup.
+
+        Returns:
+            Compilation times (language_model, encoder) in seconds, and the
+            measured KV cache size for an extensible KV cache.
+
+        """
         raise NotImplementedError
+
+    def extensible_kv_cache_unsupported_reason(self) -> str | None:
+        """Why this worker cannot back an extensible KV cache, or None."""
+        return f"{type(self).__name__} does not support the extensible KV cache"
+
+    def disable_extensible_kv_cache(self) -> None:
+        self.vllm_config.cache_config.enable_extensible_kv_cache = False
+
+    def extend_kv_cache(self, num_blocks: int) -> None:
+        """Commit the final size of an extensible KV cache."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support the extensible KV cache."
+        )
 
     def check_health(self) -> None:
         """Basic health check (override for device-specific checks)."""
         return
+
+    def synchronize_device(self) -> None:
+        """Block until in-flight device work completes; backends outside
+        `torch.accelerator` must override with their own wait."""
+        if torch.accelerator.is_available():
+            torch.accelerator.synchronize()
 
     def init_device(self) -> None:
         """Initialize device state, such as loading the model or other on-device
@@ -105,55 +160,59 @@ class WorkerBase:
         """
         raise NotImplementedError
 
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        """Initialize the KV cache with the given size in blocks."""
-        raise NotImplementedError
-
     def reset_mm_cache(self) -> None:
         reset_fn = getattr(self.model_runner, "reset_mm_cache", None)
         if callable(reset_fn):
             reset_fn()
 
+    def release_late_interaction_query_cache(self, query_keys: list[str]) -> None:
+        release_fn = getattr(
+            self.model_runner, "release_late_interaction_query_cache", None
+        )
+        if callable(release_fn):
+            release_fn(query_keys)
+
     def get_model(self) -> nn.Module:
         raise NotImplementedError
+
+    def supports_draft_weight_updates(self) -> bool:
+        """Whether this worker can update its configured speculative model."""
+        return False
+
+    def has_incomplete_weight_update(self) -> bool:
+        """Whether a weight update started and has not finished successfully,
+        so the model weights may be incomplete."""
+        return False
 
     def apply_model(self, fn: Callable[[nn.Module], _R]) -> _R:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
-    def load_model(self) -> None:
+    def get_model_inspection(self) -> str:
+        """Return a transformers-style hierarchical view of the model."""
+        from vllm.model_inspection import format_model_inspection
+
+        return format_model_inspection(self.get_model())
+
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load model onto target device."""
         raise NotImplementedError
 
-    def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
-        raise NotImplementedError
+    def execute_model(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        """If this method returns None, sample_tokens should be called immediately after
+        to obtain the ModelRunnerOutput.
 
-    def start_worker_execution_loop(self) -> None:
-        """Execute model loop in parallel worker.
-
-        You can stop the loop by executing a driver worker with an empty output.
-        See `stop_remote_worker_execution_loop` for more details.
-        """
-        raise NotImplementedError("Dead V0 code")
-
-    def determine_num_available_blocks(self) -> tuple[int, int]:
-        """Determine the number of available blocks for the GPU KV cache and
-        swappable CPU KV cache.
-
-        The implementation may run profiling or other heuristics to determine
-        the size of caches.
-
-        Returns a tuple[num_gpu_blocks, num_cpu_blocks], where num_gpu_blocks
-        are blocks that are "active" on the device and can be appended to.
-        num_cpu_blocks refers to "swapped" blocks in CPU memory and cannot be
-        appended to.
+        Note that this design may be changed in future if/when structured outputs
+        parallelism is re-architected.
         """
         raise NotImplementedError
 
-    def get_cache_block_size_bytes(self) -> int:
-        """Return the size of a single cache block, in bytes. Used in
-        speculative decoding.
-        """
+    def sample_tokens(
+        self, grammar_output: GrammarOutput
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Should be called immediately after execute_model iff it returned None."""
         raise NotImplementedError
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -179,8 +238,7 @@ class WorkerBase:
 
 
 class WorkerWrapperBase:
-    """
-    This class represents one process in an executor/engine. It is responsible
+    """This class represents one process in an executor/engine. It is responsible
     for lazily initializing the worker and handling the worker's lifecycle.
     We first instantiate the WorkerWrapper, which remembers the worker module
     and class name. Then, when we call `update_environment_variables`, and the
@@ -189,11 +247,10 @@ class WorkerWrapperBase:
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
         rpc_rank: int = 0,
+        global_rank: int | None = None,
     ) -> None:
-        """
-        Initialize the worker wrapper with the given vllm_config and rpc_rank.
+        """Initialize the worker wrapper with the given vllm_config and rpc_rank.
         Note: rpc_rank is the rank of the worker in the executor. In most cases,
         it is also the rank of the worker in the distributed group. However,
         when multiple executors work together, they can be different.
@@ -202,74 +259,73 @@ class WorkerWrapperBase:
         All workers have rpc_rank=0, but they have different ranks in the TP
         group.
         """
-        self.rpc_rank = rpc_rank
-        self.worker: WorkerBase | None = None
-        self.vllm_config: VllmConfig | None = None
-        # do not store this `vllm_config`, `init_worker` will set the final
-        # one. TODO: investigate if we can remove this field in
-        # `WorkerWrapperBase`, `init_cached_hf_modules` should be
-        # unnecessary now.
-        if vllm_config.model_config is not None:
-            # it can be None in tests
-            trust_remote_code = vllm_config.model_config.trust_remote_code
-            if trust_remote_code:
-                # note: lazy import to avoid importing torch before initializing
-                from vllm.utils import init_cached_hf_modules
+        self.rpc_rank: int = rpc_rank
+        self.global_rank: int = self.rpc_rank if global_rank is None else global_rank
 
-                init_cached_hf_modules()
+        # Initialized after init_worker is called
+        self.worker: WorkerBase
+        self.vllm_config: VllmConfig
+        self._worker_extension_cls: type | None = None
 
     def shutdown(self) -> None:
         if self.worker is not None:
+            hook = getattr(self._worker_extension_cls, "destroy_worker_extension", None)
+            if callable(hook):
+                try:
+                    hook(self.worker)
+                except Exception:
+                    # Don't raise: callers still need to run their own teardown.
+                    logger.exception("Worker extension destroy hook failed.")
             self.worker.shutdown()
-
-    def adjust_rank(self, rank_mapping: dict[int, int]) -> None:
-        """
-        Adjust the rpc_rank based on the given mapping.
-        It is only used during the initialization of the executor,
-        to adjust the rpc_rank of workers after we create all workers.
-        """
-        if self.rpc_rank in rank_mapping:
-            self.rpc_rank = rank_mapping[self.rpc_rank]
 
     def update_environment_variables(
         self,
         envs_list: list[dict[str, str]],
     ) -> None:
         envs = envs_list[self.rpc_rank]
-        key = "CUDA_VISIBLE_DEVICES"
-        if key in envs and key in os.environ:
-            # overwriting CUDA_VISIBLE_DEVICES is desired behavior
-            # suppress the warning in `update_environment_variables`
-            del os.environ[key]
         update_environment_variables(envs)
 
+    @instrument(span_name="Worker init")
     def init_worker(self, all_kwargs: list[dict[str, Any]]) -> None:
-        """
-        Here we inject some common logic before initializing the worker.
+        """Here we inject some common logic before initializing the worker.
         Arguments are passed to the worker class constructor.
         """
         kwargs = all_kwargs[self.rpc_rank]
-        self.vllm_config = kwargs.get("vllm_config")
-        assert self.vllm_config is not None, (
+
+        vllm_config: VllmConfig | None = kwargs.get("vllm_config")
+        assert vllm_config is not None, (
             "vllm_config is required to initialize the worker"
         )
-        enable_trace_function_call_for_thread(self.vllm_config)
+        self.vllm_config = vllm_config
+
+        vllm_config.enable_trace_function_call_for_thread()
 
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()
 
-        if isinstance(self.vllm_config.parallel_config.worker_cls, str):
-            worker_class = resolve_obj_by_qualname(
-                self.vllm_config.parallel_config.worker_cls
+        # Let the platform replace core Triton kernels before any worker or
+        # model code can launch them.
+        from vllm.platforms import current_platform
+
+        current_platform.register_triton_kernel_overrides()
+
+        parallel_config = vllm_config.parallel_config
+        if isinstance(parallel_config.worker_cls, str):
+            worker_class: type[WorkerBase] = resolve_obj_by_qualname(
+                parallel_config.worker_cls
             )
         else:
             raise ValueError(
-                "passing worker_cls is no longer supported. Please pass keep the class in a separate module and pass the qualified name of the class as a string."  # noqa: E501
+                "passing worker_cls is no longer supported. "
+                "Please pass keep the class in a separate module "
+                "and pass the qualified name of the class as a string."
             )
-        if self.vllm_config.parallel_config.worker_extension_cls:
+
+        worker_extension_cls: type | None = None
+        if parallel_config.worker_extension_cls:
             worker_extension_cls = resolve_obj_by_qualname(
-                self.vllm_config.parallel_config.worker_extension_cls
+                parallel_config.worker_extension_cls
             )
             extended_calls = []
             if worker_extension_cls not in worker_class.__bases__:
@@ -295,60 +351,43 @@ class WorkerWrapperBase:
                     extended_calls,
                 )
 
+        assigned_physical_gpu_ids = kwargs.pop("assigned_physical_gpu_ids", None)
+        if assigned_physical_gpu_ids is not None:
+            vllm_config.parallel_config.assigned_physical_gpu_ids = (
+                assigned_physical_gpu_ids
+            )
+
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
-        if shared_worker_lock is None:
-            msg = (
-                "Missing `shared_worker_lock` argument from executor. "
-                "This argument is needed for mm_processor_cache_type='shm'."
-            )
-
-            mm_config = self.vllm_config.model_config.multimodal_config
-            if mm_config and mm_config.mm_processor_cache_type == "shm":
-                raise ValueError(msg)
-            else:
-                logger.warning_once(msg)
-
-            self.mm_receiver_cache = None
-        else:
-            self.mm_receiver_cache = worker_receiver_cache_from_config(
-                self.vllm_config,
-                MULTIMODAL_REGISTRY,
-                shared_worker_lock,
-            )
+        self.mm_receiver_cache = worker_receiver_cache_from_config(
+            vllm_config,
+            shared_worker_lock,
+        )
 
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs)
-            assert self.worker is not None
+            self._worker_extension_cls = worker_extension_cls
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
-        kv_cache_config = kv_cache_configs[self.rpc_rank]
+        kv_cache_config = kv_cache_configs[self.global_rank]
+        assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
             self.worker.initialize_from_config(kv_cache_config)  # type: ignore
 
+    def extend_kv_cache(self, num_blocks: int) -> None:
+        # The KV connector created here reads the current config.
+        assert self.vllm_config is not None
+        with set_current_vllm_config(self.vllm_config):
+            self.worker.extend_kv_cache(num_blocks)  # type: ignore
+
     def init_device(self):
+        assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during device initialization
             self.worker.init_device()  # type: ignore
-
-    def execute_method(self, method: str | bytes, *args, **kwargs):
-        try:
-            # method resolution order:
-            # if a method is defined in this class, it will be called directly.
-            # otherwise, since we define `__getattr__` and redirect attribute
-            # query to `self.worker`, the method will be called on the worker.
-            return run_method(self, method, args, kwargs)
-        except Exception as e:
-            # if the driver worker also execute methods,
-            # exceptions in the rest worker may cause deadlock in rpc like ray
-            # see https://github.com/vllm-project/vllm/issues/3455
-            # print the error and inform the user to solve the error
-            msg = (
-                f"Error executing method {method!r}. "
-                "This might cause deadlock in distributed execution."
-            )
-            logger.exception(msg)
-            raise e
+            hook = getattr(self._worker_extension_cls, "init_worker_extension", None)
+            if callable(hook):
+                hook(self.worker)
 
     def __getattr__(self, attr: str):
         return getattr(self.worker, attr)
@@ -364,20 +403,15 @@ class WorkerWrapperBase:
             )
 
     def execute_model(
-        self,
-        scheduler_output: SchedulerOutput,
-        *args,
-        **kwargs,
-    ) -> ModelRunnerOutput:
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         self._apply_mm_cache(scheduler_output)
 
-        assert self.worker is not None
-        return self.worker.execute_model(scheduler_output, *args, **kwargs)
+        return self.worker.execute_model(scheduler_output)
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
         if mm_receiver_cache is not None:
             mm_receiver_cache.clear_cache()
 
-        assert self.worker is not None
         self.worker.reset_mm_cache()

@@ -15,22 +15,22 @@ import torch.nn as nn
 from typing_extensions import TypeIs, TypeVar
 
 from vllm.logger import init_logger
-from vllm.utils import supports_kw
+from vllm.tasks import ScoreType
+from vllm.utils.func_utils import supports_kw
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.model import AttnTypeStr
+    from vllm.config.pooler import SequencePoolingType, TokenPoolingType
     from vllm.model_executor.layers.pooler import Pooler
 else:
     VllmConfig = Any
     Pooler = Any
+    SequencePoolingType = Any
+    TokenPoolingType = Any
+    AttnTypeStr = Any
 
 logger = init_logger(__name__)
-
-# The type of hidden states
-# Currently, T = torch.Tensor for all models except for Medusa
-# which has T = list[torch.Tensor]
-T = TypeVar("T", default=torch.Tensor)
-T_co = TypeVar("T_co", default=torch.Tensor, covariant=True)
 
 # NOTE: Unlike those in `interfaces.py`, we don't define `ClassVar` tags
 # for the base interfaces to avoid breaking OOT registration for existing models
@@ -38,39 +38,39 @@ T_co = TypeVar("T_co", default=torch.Tensor, covariant=True)
 
 
 @runtime_checkable
-class VllmModel(Protocol[T_co]):
+class VllmModel(Protocol):
     """The interface required for all models in vLLM."""
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-    ) -> None: ...
+    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None: ...
 
-    def get_input_embeddings(
-        self,
-        input_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Apply token embeddings to `input_ids`."""
         ...
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> T_co: ...
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor: ...
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        """Return True for checkpoint weights this model does not load.
+
+        Defining this method is optional for satisfying this interface.
+        Override with the same rule used in `load_weights`. Models without
+        a selection rule keep every checkpoint weight by default.
+        """
+        return False
 
 
 def _check_vllm_model_init(model: type[object] | object) -> bool:
-    model_init = model.__init__
+    model_init = getattr(model, "__init__")  # noqa: B009
     return supports_kw(model_init, "vllm_config")
 
 
-def _check_vllm_model_get_input_embeddings(model: type[object] | object) -> bool:
-    model_get_input_embeddings = getattr(model, "get_input_embeddings", None)
-    if not callable(model_get_input_embeddings):
+def _check_vllm_model_embed_input_ids(model: type[object] | object) -> bool:
+    model_embed_input_ids = getattr(model, "embed_input_ids", None)
+    if not callable(model_embed_input_ids):
         logger.warning(
-            "The model (%s) is missing the `get_input_embeddings` method.",
+            "The model (%s) is missing the `embed_input_ids` method.",
             model,
         )
         return False
@@ -110,19 +110,19 @@ def is_vllm_model(
 ) -> TypeIs[type[VllmModel]] | TypeIs[VllmModel]:
     return (
         _check_vllm_model_init(model)
-        and _check_vllm_model_get_input_embeddings(model)
+        and _check_vllm_model_embed_input_ids(model)
         and _check_vllm_model_forward(model)
     )
 
 
 @runtime_checkable
-class VllmModelForTextGeneration(VllmModel[T], Protocol[T]):
+class VllmModelForTextGeneration(VllmModel, Protocol):
     """The interface required for all generative models in vLLM."""
 
     def compute_logits(
         self,
-        hidden_states: T,
-    ) -> T | None:
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
         """Return `None` if TP rank > 0."""
         ...
 
@@ -143,14 +143,12 @@ def is_text_generation_model(
     if not is_vllm_model(model):
         return False
 
-    if isinstance(model, type):
-        return isinstance(model, VllmModelForTextGeneration)
-
-    return isinstance(model, VllmModelForTextGeneration)
+    # Optional protocol defaults are not inherited by structural models.
+    return callable(getattr(model, "compute_logits", None))
 
 
 @runtime_checkable
-class VllmModelForPooling(VllmModel[T_co], Protocol[T_co]):
+class VllmModelForPooling(VllmModel, Protocol):
     """The interface required for all pooling models in vLLM."""
 
     is_pooling_model: ClassVar[Literal[True]] = True
@@ -162,15 +160,56 @@ class VllmModelForPooling(VllmModel[T_co], Protocol[T_co]):
         MRO of your model class.
     """
 
-    default_pooling_type: ClassVar[str] = "LAST"
+    default_seq_pooling_type: ClassVar[SequencePoolingType] = "LAST"
     """
-    Indicates the
-    [vllm.model_executor.layers.pooler.PoolerConfig.pooling_type][]
+    Indicates the [vllm.config.pooler.PoolerConfig.seq_pooling_type][]
     to use by default.
 
     You can use the
     [vllm.model_executor.models.interfaces_base.default_pooling_type][]
     decorator to conveniently set this field.
+    """
+
+    default_tok_pooling_type: ClassVar[TokenPoolingType] = "ALL"
+    """
+    Indicates the [vllm.config.pooler.PoolerConfig.tok_pooling_type][]
+    to use by default.
+
+    You can use the
+    [vllm.model_executor.models.interfaces_base.default_pooling_type][]
+    decorator to conveniently set this field.
+    """
+
+    attn_type: ClassVar[AttnTypeStr] = "decoder"
+    """
+    Indicates the
+    [vllm.config.model.ModelConfig.attn_type][]
+    to use by default.
+
+    You can use the
+    [vllm.model_executor.models.interfaces_base.attn_type][]
+    decorator to conveniently set this field.
+    """
+
+    score_type: ClassVar[ScoreType] = "bi-encoder"
+    """
+    Indicates the
+    [vllm.config.model.ModelConfig.score_type][]
+    to use by default.
+
+    Scoring API handles score/rerank for:
+
+    - "classify" task (score_type: cross-encoder models)
+    - "embed" task (score_type: bi-encoder models)
+    - "token_embed" task (score_type: late interaction models)
+
+    score_type defaults to bi-encoder, then the Score API uses the "embed" task.
+    If you set score_type to cross-encoder via
+    [vllm.model_executor.models.interfaces.SupportsCrossEncoding][],
+    then the Score API uses the "score" task.
+    If you set score_type to late-interaction via
+    [vllm.model_executor.models.interfaces.SupportsLateInteraction][],
+    then the Score API uses the "token_embed" task.
     """
 
     pooler: Pooler
@@ -197,15 +236,53 @@ def is_pooling_model(
 _T = TypeVar("_T", bound=type[nn.Module])
 
 
-def default_pooling_type(pooling_type: str):
-    """Decorator to set `VllmModelForPooling.default_pooling_type`."""
+def default_pooling_type(
+    *,
+    seq_pooling_type: SequencePoolingType = "LAST",
+    tok_pooling_type: TokenPoolingType = "ALL",
+):
+    """Decorator to set `VllmModelForPooling.default_*_pooling_type`."""
 
     def func(model: _T) -> _T:
-        model.default_pooling_type = pooling_type  # type: ignore
+        model.default_seq_pooling_type = seq_pooling_type  # type: ignore
+        model.default_tok_pooling_type = tok_pooling_type  # type: ignore
         return model
 
     return func
 
 
-def get_default_pooling_type(model: type[object] | object) -> str:
-    return getattr(model, "default_pooling_type", "LAST")
+def get_default_seq_pooling_type(
+    model: type[object] | object,
+) -> SequencePoolingType:
+    return getattr(model, "default_seq_pooling_type", "LAST")
+
+
+def get_default_tok_pooling_type(
+    model: type[object] | object,
+) -> TokenPoolingType:
+    return getattr(model, "default_tok_pooling_type", "ALL")
+
+
+def attn_type(attn_type: AttnTypeStr):
+    """Decorator to set `VllmModelForPooling.attn_type`."""
+
+    def func(model: _T) -> _T:
+        model.attn_type = attn_type  # type: ignore
+        return model
+
+    return func
+
+
+def get_attn_type(model: type[object] | object) -> AttnTypeStr:
+    return getattr(model, "attn_type", "decoder")
+
+
+def get_score_type(model: type[object] | object) -> ScoreType:
+    score_types: set[ScoreType] = set()
+    model_cls = model if isinstance(model, type) else type(model)
+    for m in model_cls.__mro__:
+        score_type: ScoreType = getattr(m, "score_type", "bi-encoder")
+        if score_type != "bi-encoder":
+            score_types.add(score_type)
+    assert len(score_types) < 2
+    return "bi-encoder" if not score_types else next(iter(score_types))

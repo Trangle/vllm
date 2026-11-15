@@ -21,16 +21,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only GLM-4.5 MTP model compatible with HuggingFace weights."""
+"""Inference-only GLM-4.5, GLM-4.6, GLM-4.7 MTP
+model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
+import typing
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 
-from vllm.config import CacheConfig, VllmConfig
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config import CacheConfig, ParallelConfig, VllmConfig
+from vllm.model_executor.layers.fused_moe import (
+    MoERunner,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -41,15 +47,23 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
-from .glm4_moe import Glm4MoeDecoderLayer, get_spec_layer_idx_from_weight_name
-from .interfaces import SupportsPP
-from .utils import maybe_prefix
+from .glm4_moe import (
+    Glm4MixtureOfExperts,
+    Glm4MoE,
+    Glm4MoeDecoderLayer,
+)
+from .utils import (
+    extract_layer_index,
+    get_fused_shared_expert_layers,
+    get_spec_layer_idx_from_weight_name,
+    maybe_prefix,
+)
 
 
 class SharedHead(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         prefix: str,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
@@ -69,10 +83,11 @@ class SharedHead(nn.Module):
 class Glm4MoeMultiTokenPredictorLayer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         prefix: str,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        parallel_config: ParallelConfig | None = None,
     ) -> None:
         super().__init__()
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -81,11 +96,14 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
+        assert parallel_config is not None
+        self.enable_eplb = parallel_config.enable_eplb
         self.mtp_block = Glm4MoeDecoderLayer(
             config=config,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=prefix,
+            enable_eplb=self.enable_eplb,
         )
 
     def forward(
@@ -98,7 +116,7 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
     ) -> torch.Tensor:
         assert inputs_embeds is not None
         # masking inputs at position 0, as not needed by MTP
-        inputs_embeds[positions == 0] = 0
+        inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -109,8 +127,12 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        hidden_states = residual + hidden_states
-        return hidden_states
+        # Apply the final norm once (fused add+norm) and recycle the
+        # post-final-norm hidden into the next draft step; compute_logits uses
+        # it directly. Matches the GLM MTP recycle contract from #47448 and
+        # vllm/models/glm5next/common/mtp.py.
+        hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
+        return hidden_states, hidden_states
 
 
 class Glm4MoeMultiTokenPredictor(nn.Module):
@@ -127,6 +149,7 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
                     f"{prefix}.layers.{idx}",
                     cache_config=vllm_config.cache_config,
                     quant_config=vllm_config.quant_config,
+                    parallel_config=vllm_config.parallel_config,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -140,7 +163,7 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -169,13 +192,11 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        logits = self.logits_processor(
-            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
-        )
+        logits = self.logits_processor(mtp_layer.shared_head.head, hidden_states)
         return logits
 
 
-class Glm4MoeMTP(nn.Module, SupportsPP):
+class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -183,12 +204,34 @@ class Glm4MoeMTP(nn.Module, SupportsPP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+        # Set MoE hyperparameters
+        self.num_moe_layers = self.config.num_nextn_predict_layers
+        self.num_expert_groups = self.config.n_group
+
+        self.moe_layers: list[MoERunner] = []
+        self.moe_mlp_layers: list[Glm4MoE] = []
+        example_moe = None
+        for layer in self.model.layers.values():
+            assert isinstance(layer, Glm4MoeMultiTokenPredictorLayer)
+            layer = layer.mtp_block
+            assert isinstance(layer, Glm4MoeDecoderLayer)
+            if isinstance(layer.mlp, Glm4MoE):
+                example_moe = layer.mlp
+                self.moe_mlp_layers.append(layer.mlp)
+                self.moe_layers.append(layer.mlp.experts)
+        self.extract_moe_parameters(example_moe)
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
+            Glm4MoE,
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
@@ -219,20 +262,40 @@ class Glm4MoeMTP(nn.Module, SupportsPP):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        fused_shared_expert_layers = self.fused_shared_expert_layers
+        # NOTE: global despite per-layer FSE; non-fused layers skip the extras.
+        num_experts = self.config.n_routed_experts
+        if fused_shared_expert_layers and self.config.n_shared_experts:
+            num_experts += self.config.n_shared_experts
+        expert_params_mapping = fused_moe_make_expert_params_mapping(
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=num_experts,
         )
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is None:
-                continue
-            name = self._rewrite_spec_layer_name(spec_layer, name)
+            if name == "lm_head.weight":
+                spec_layer = self.model.mtp_start_layer_idx
+                name = f"model.layers.{spec_layer}.shared_head.head.weight"
+            elif name == "model.embed_tokens.weight":
+                spec_layer = self.model.mtp_start_layer_idx
+            else:
+                spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+                if spec_layer is None:
+                    continue
+                name = self._rewrite_spec_layer_name(spec_layer, name)
+
+            # Only parse the layer index when FSE is enabled.
+            is_fusion_moe_shared_experts_layer = (
+                "mlp.shared_experts" in name
+                and bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
+                and extract_layer_index(name) in fused_shared_expert_layers
+            )
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -245,6 +308,8 @@ class Glm4MoeMTP(nn.Module, SupportsPP):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
+                if is_fusion_moe_shared_experts_layer:
+                    continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -255,46 +320,109 @@ class Glm4MoeMTP(nn.Module, SupportsPP):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
+                # FSE: split a widened mlp.shared_experts tensor into
+                # n_shared_experts chunks; see deepseek_v2.py for details.
+                num_chunks = 1
+                split_dim = 0
+                chunk_size = 0
+                if is_fusion_moe_shared_experts_layer:
+                    num_chunks = getattr(self.config, "n_shared_experts", 1) or 1
+                    split_dim = (
+                        1
+                        if ("down_proj.weight" in name and loaded_weight.ndim > 1)
+                        else 0
                     )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+                    total = loaded_weight.shape[split_dim]
+                    if total % num_chunks != 0:
+                        raise ValueError(
+                            f"FSE shared-expert weight {name} has dim "
+                            f"{total} along axis {split_dim} which is "
+                            f"not divisible by "
+                            f"n_shared_experts={num_chunks}."
+                        )
+                    chunk_size = total // num_chunks
 
-                    # According to DeepSeek-V3 Technical Report, MTP modules
-                    # shares embedding layer. We only load the first weights.
-                    if (
-                        spec_layer != self.model.mtp_start_layer_idx
-                        and ".layers" not in name
-                    ):
-                        continue
+                for j in range(num_chunks):
+                    chunk_name = name
+                    weight_to_load = loaded_weight
 
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                    if is_fusion_moe_shared_experts_layer:
+                        chunk_slice = slice(j * chunk_size, (j + 1) * chunk_size)
+                        if loaded_weight.ndim == 1:
+                            weight_to_load = loaded_weight[chunk_slice]
+                        elif split_dim == 0:
+                            weight_to_load = loaded_weight[chunk_slice, :]
+                        else:
+                            weight_to_load = loaded_weight[:, chunk_slice]
+                        chunk_name = name.replace(
+                            "mlp.shared_experts",
+                            f"mlp.experts.{self.config.n_routed_experts + j}",
+                        )
+
+                    is_expert_weight = False
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in chunk_name:
+                            continue
+
+                        is_expert_weight = True
+                        name_mapped = chunk_name.replace(weight_name, param_name)
+
+                        param = params_dict[name_mapped]
+                        # Use return_success so we don't blindly mark
+                        # remote-expert replicas as loaded on this rank.
+                        weight_loader = typing.cast(
+                            Callable[..., bool], param.weight_loader
+                        )
+                        success = weight_loader(
+                            param,
+                            weight_to_load,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
+                        if success:
+                            if not is_fusion_moe_shared_experts_layer:
+                                name = name_mapped
+                            else:
+                                loaded_params.add(name_mapped)
+                            break
+                    else:
+                        if is_expert_weight:
+                            # Expert weight not local to this rank; skip.
+                            continue
+
+                        # Skip loading extra bias for GPTQ models.
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        # Some checkpoints include weight scale tensors for
+                        # the LM head even when the quantized head isn't
+                        # built. Skip them if the model does not expose a
+                        # matching parameter to avoid KeyError during load.
+                        if name.endswith(".weight_scale") and name not in params_dict:
+                            continue
+
+                        # According to DeepSeek-V3 Technical Report, MTP
+                        # modules share the embedding layer. We only load
+                        # the first weights.
+                        if (
+                            spec_layer != self.model.mtp_start_layer_idx
+                            and ".layers" not in name
+                        ):
+                            continue
+
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+            if not is_fusion_moe_shared_experts_layer:
+                loaded_params.add(name)
         return loaded_params
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        """
-        Rewrite the weight name to match the format of the original model.
+        """Rewrite the weight name to match the format of the original model.
         Add .mtp_block for modules in transformer layer block for spec layer
         and rename shared layer weights to be top level.
         """

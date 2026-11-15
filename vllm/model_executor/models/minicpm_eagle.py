@@ -26,10 +26,11 @@
 
 import math
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -37,14 +38,13 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsLoRA, SupportsPP
+from .interfaces import SupportsEagle, SupportsLoRA, SupportsPP
 from .minicpm import MiniCPMAttention as EagleMiniCPMAttention
 from .minicpm import MiniCPMMLP as EagleMiniCPMMLP
 from .minicpm import MiniCPMMoE as EagleMiniCPMMoE
@@ -53,13 +53,22 @@ from .utils import (
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
+    process_eagle_weight,
 )
+
+if TYPE_CHECKING:
+
+    class _EagleMiniCPMSupportsPP:
+        pass
+
+else:
+    _EagleMiniCPMSupportsPP = SupportsPP
 
 
 class EagleMiniCPMDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -69,9 +78,10 @@ class EagleMiniCPMDecoderLayer(nn.Module):
         self.cache_config = cache_config
         self.quant_config = quant_config
         self.hidden_size = config.hidden_size
-        self.rope_theta = getattr(config, "rope_theta", 10000)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        self.mup_denominator = getattr(
+            config, "mup_denominator", config.num_hidden_layers
+        )
         self.prefix = prefix
         self._init_attn_block()
         self._init_ffn_block()
@@ -84,8 +94,7 @@ class EagleMiniCPMDecoderLayer(nn.Module):
             hidden_size=self.hidden_size,
             num_heads=self.config.num_attention_heads,
             num_kv_heads=self.config.num_key_value_heads,
-            rope_theta=self.rope_theta,
-            rope_scaling=self.rope_scaling,
+            rope_parameters=self.config.rope_parameters,
             max_position_embeddings=self.max_position_embeddings,
             cache_config=self.cache_config,
             quant_config=self.quant_config,
@@ -111,6 +120,7 @@ class EagleMiniCPMDecoderLayer(nn.Module):
                 top_k=self.config.num_experts_per_tok,
                 hidden_size=self.config.hidden_size,
                 intermediate_size=self.config.intermediate_size,
+                prefix=f"{self.prefix}.mlp",
             )
 
     def forward(
@@ -127,7 +137,7 @@ class EagleMiniCPMDecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
         hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.mup_denominator)
+            self.config.scale_depth / math.sqrt(self.mup_denominator)
         )
 
         # Fully Connected
@@ -135,7 +145,7 @@ class EagleMiniCPMDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.mup_denominator)
+            self.config.scale_depth / math.sqrt(self.mup_denominator)
         )
 
         return hidden_states, None
@@ -148,21 +158,18 @@ class EagleMiniCPMModel(nn.Module):
     ):
         super().__init__()
 
-        config = vllm_config.speculative_config.draft_model_config.hf_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        config = speculative_config.draft_model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
 
         self.config = config
         self.cache_config = cache_config
         self.quant_config = quant_config
-        lora_vocab = (
-            (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1))
-            if lora_config
-            else 0
-        )
-        self.vocab_size = config.vocab_size + lora_vocab
-        self.org_vocab_size = config.vocab_size
+
+        self.vocab_size = config.vocab_size
+
         self.fc = torch.nn.Linear(
             self.config.hidden_size * 2, self.config.hidden_size, bias=False
         )
@@ -171,7 +178,6 @@ class EagleMiniCPMModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
-            org_num_embeddings=config.vocab_size,
         )
         self.num_experts = getattr(self.config, "num_experts", 0)
         self._init_layers(prefix, config, cache_config, quant_config, start_layer)
@@ -183,7 +189,7 @@ class EagleMiniCPMModel(nn.Module):
     def _init_layers(
         self,
         prefix: str,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
         start_layer: int,
@@ -200,7 +206,7 @@ class EagleMiniCPMModel(nn.Module):
             ]
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         embedding = self.embed_tokens(input_ids)
         return embedding * self.config.scale_emb
 
@@ -210,7 +216,7 @@ class EagleMiniCPMModel(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | IntermediateTensors:
-        input_embeds = self.get_input_embeddings(input_ids)
+        input_embeds = self.embed_input_ids(input_ids)
         input_embeds = self.input_norm1(input_embeds)
         hidden_states = self.input_norm2(hidden_states)
 
@@ -296,7 +302,9 @@ class EagleMiniCPMModel(nn.Module):
         return loaded_params
 
 
-class EagleMiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+class EagleMiniCPMForCausalLM(
+    nn.Module, SupportsLoRA, _EagleMiniCPMSupportsPP, SupportsEagle
+):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -314,25 +322,23 @@ class EagleMiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         "embed_tokens": "input_embeddings",
         "lm_head": "output_embeddings",
     }
-    embedding_padding_modules = ["lm_head"]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        config = vllm_config.speculative_config.draft_model_config.hf_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        config = speculative_config.draft_model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
 
         self.prefix = prefix
         self.vllm_config = vllm_config
         self.config = config
-        self.lora_config = lora_config
+
         self.cache_config = cache_config
         self.quant_config = quant_config
 
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
 
         self.model = self._init_model(
             vllm_config=vllm_config,
@@ -340,18 +346,9 @@ class EagleMiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             start_layer=target_layer_num,
         )
 
-        unpadded_vocab_size = config.vocab_size
-        if lora_config:
-            unpadded_vocab_size += lora_config.lora_extra_vocab_size
         self.lm_head = ParallelLMHead(
-            unpadded_vocab_size,
+            config.vocab_size,
             config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            padding_size=DEFAULT_VOCAB_PADDING_SIZE
-            # We need bigger padding if using lora for kernel
-            # compatibility
-            if not lora_config
-            else lora_config.lora_vocab_padding_size,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
@@ -359,7 +356,7 @@ class EagleMiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         self.scale_width = self.config.hidden_size / self.config.dim_model_base
 
-        self.logits_processor = LogitsProcessor(unpadded_vocab_size, config.vocab_size)
+        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -371,15 +368,20 @@ class EagleMiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             vllm_config=vllm_config, prefix=prefix, start_layer=start_layer
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if inputs_embeds is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support multimodal inputs yet."
+            )
         hidden_states, hidden_states2 = self.model(input_ids, positions, hidden_states)
         hidden_states = hidden_states / self.scale_width
         hidden_states2 = hidden_states2 / self.scale_width
@@ -393,8 +395,10 @@ class EagleMiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
-        return loader.load_weights(weights)
+        def transform(inputs):
+            name, loaded_weight = inputs
+            process_eagle_weight(self, name)
+            return name, loaded_weight
+
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(map(transform, weights))

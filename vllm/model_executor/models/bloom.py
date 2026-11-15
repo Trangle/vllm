@@ -27,7 +27,6 @@ import torch
 from torch import nn
 from transformers import BloomConfig
 
-from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -36,6 +35,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -47,13 +47,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsPP, SupportsQuant
 from .utils import (
     AutoWeightsLoader,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -108,12 +106,14 @@ class BloomAttention(nn.Module):
             self.total_num_heads,
             bias=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.query_key_value",
         )
         self.dense = RowParallelLinear(
             self.hidden_size,
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.dense",
         )
 
         # Create the alibi slopes and slice them.
@@ -152,6 +152,7 @@ class BloomMLP(nn.Module):
         self,
         config: BloomConfig,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -159,12 +160,14 @@ class BloomMLP(nn.Module):
             hidden_size,
             4 * hidden_size,
             quant_config=quant_config,
+            prefix=f"{prefix}.dense_h_to_4h",
         )
         self.gelu_impl = get_act_fn("gelu")
         self.dense_4h_to_h = RowParallelLinear(
             4 * hidden_size,
             hidden_size,
             quant_config=quant_config,
+            prefix=f"{prefix}.dense_4h_to_h",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -192,7 +195,7 @@ class BloomBlock(nn.Module):
         self.post_attention_layernorm = nn.LayerNorm(
             hidden_size, eps=config.layer_norm_epsilon
         )
-        self.mlp = BloomMLP(config, quant_config)
+        self.mlp = BloomMLP(config, quant_config, prefix=f"{prefix}.mlp")
         self.apply_residual_connection_post_layernorm = (
             config.apply_residual_connection_post_layernorm
         )
@@ -266,12 +269,12 @@ class BloomModel(nn.Module):
             ["hidden_states"], config.hidden_size
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.word_embeddings(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         position_ids: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
@@ -280,7 +283,7 @@ class BloomModel(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
+                hidden_states = self.embed_input_ids(input_ids)
             hidden_states = self.word_embeddings_layernorm(hidden_states)
         else:
             assert intermediate_tensors is not None
@@ -292,36 +295,23 @@ class BloomModel(nn.Module):
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
+    def _repack_qkv(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        # BLOOM's fused QKV is laid out as (num_heads * 3 * head_size) on its
+        # output dim (0), while vLLM expects (3 * num_heads * head_size).
+        num_heads = self.config.num_attention_heads
         for name, loaded_weight in weights:
-            if is_pp_missing_parameter(name, self):
-                continue
-            param = params_dict[name]
-
             if "query_key_value" in name:
-                # NOTE: BLOOM's fused QKV's output_dim has the shape of
-                # (num_heads * 3 * head_size), while the
-                # required shape is (3 * num_heads * head_size).
-                # Thus, we need weight conversion.
-                output_dim = getattr(param, "output_dim", None)
-                num_heads = self.config.num_attention_heads
-                if output_dim is not None:
-                    loaded_weight_shape = loaded_weight.shape
-                    loaded_weight = loaded_weight.view(
-                        loaded_weight_shape[:output_dim]
-                        + (num_heads, 3, -1)
-                        + loaded_weight_shape[output_dim + 1 :]
-                    )
-                    loaded_weight = loaded_weight.transpose(output_dim, output_dim + 1)
-                    loaded_weight = loaded_weight.reshape(loaded_weight_shape)
+                shape = loaded_weight.shape
+                loaded_weight = loaded_weight.view((num_heads, 3, -1) + shape[1:])
+                loaded_weight = loaded_weight.transpose(0, 1)
+                loaded_weight = loaded_weight.reshape(shape)
+            yield name, loaded_weight
 
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(self._repack_qkv(weights))
 
 
 class BloomForCausalLM(nn.Module, SupportsPP, SupportsQuant):
@@ -334,26 +324,25 @@ class BloomForCausalLM(nn.Module, SupportsPP, SupportsQuant):
         self.transformer = BloomModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "transformer")
         )
+        self.lm_head = ParallelLMHead(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
         if self.config.tie_word_embeddings:
-            self.lm_head = self.transformer.word_embeddings
-        else:
-            self.lm_head = ParallelLMHead(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
+            self.lm_head = self.lm_head.tie_weights(self.transformer.word_embeddings)
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.transformer.make_empty_intermediate_tensors
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.transformer.get_input_embeddings(input_ids)
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.transformer.embed_input_ids(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -371,7 +360,7 @@ class BloomForCausalLM(nn.Module, SupportsPP, SupportsQuant):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["lm_head.weight"])
+        loader = AutoWeightsLoader(self)
         weights = _add_transformer_prefix(weights)
         return loader.load_weights(weights)
 

@@ -41,7 +41,7 @@ MODEL=meta-llama/Llama-3.3-70B-Instruct SYSTEM=TPU TP=8 DOWNLOAD_DIR='' INPUT_LE
 | --- | --- | --- |
 | `BASE` | **Required.** The absolute path to the parent directory of your vLLM repository directory. | `"$HOME"` |
 | `MODEL` | **Required.** The Hugging Face model identifier to be served by vllm. | `"meta-llama/Llama-3.1-8B-Instruct"` |
-| `SYSTEM`| **Required.** The hardware you are running on. Choices: `TPU` or `GPU`. (For other systems, it might not support saving profiles) | `"TPU"` |
+| `SYSTEM` | **Required.** The hardware you are running on. Choices: `TPU` or `GPU`. (For other systems, it might not support saving profiles) | `"TPU"` |
 | `TP` | **Required.** The tensor-parallelism size. | `1` |
 | `DOWNLOAD_DIR` | **Required.** Directory to download and load model weights from. | `""` (default download path) |
 | `INPUT_LEN` | **Required.** Request input length. | `4000` |
@@ -51,6 +51,7 @@ MODEL=meta-llama/Llama-3.3-70B-Instruct SYSTEM=TPU TP=8 DOWNLOAD_DIR='' INPUT_LE
 | `MAX_LATENCY_ALLOWED_MS` | The maximum allowed P99 end-to-end latency in milliseconds. Set to a very large number (e.g., `100000000000`) to effectively ignore the latency constraint. | `500` |
 | `NUM_SEQS_LIST` | A space-separated string of `max-num-seqs` values to test. | `"128 256"` |
 | `NUM_BATCHED_TOKENS_LIST` | A space-separated string of `max-num-batched-tokens` values to test. | `"1024 2048 4096"` |
+| `GPU_MEMORY_UTILIZATION` | Optional. A fixed `gpu-memory-utilization` that skips the search below. Leave it unset on GPU unless the GPU is shared; see [GPU Memory Utilization](../../docs/configuration/optimization.md#gpu-memory-utilization). | `""` |
 
 **Note**: The default `NUM_SEQS_LIST` and `NUM_BATCHED_TOKENS_LIST` are set for medium-sized inputs/outputs. For very short contexts (e.g., 20 input, 20 output tokens), you may need to test larger values for `max-num-seqs`.
 
@@ -83,7 +84,7 @@ MIN_CACHE_HIT_PCT=0
 MAX_LATENCY_ALLOWED_MS=100000000000 # A very large number
 ```
 
-#### 2. Maximize Throughput with a Latency Requirement
+### 2. Maximize Throughput with a Latency Requirement
 
 - **Goal**: Find the best server parameters when P99 end-to-end latency must be below 500ms.
 - **Configuration**:
@@ -96,7 +97,7 @@ MIN_CACHE_HIT_PCT=0
 MAX_LATENCY_ALLOWED_MS=500
 ```
 
-#### 3. Maximize Throughput with Prefix Caching and Latency Requirements
+### 3. Maximize Throughput with Prefix Caching and Latency Requirements
 
 - **Goal**: Find the best server parameters assuming a 60% prefix cache hit rate and a latency requirement of 500ms.
 - **Configuration**:
@@ -136,7 +137,7 @@ best_max_num_seqs: 256, best_num_batched_tokens: 2048, best_throughput: 12.5, pr
 
 The script follows a systematic process to find the optimal parameters:
 
-1. **Find Max GPU Memory Utilization**: The script first determines the highest safe `gpu-memory-utilization` (starting from 0.98 and decreasing) that does not cause an Out-Of-Memory (OOM) error when launching the server. This ensures the benchmark runs use the maximum available memory without crashing.
+1. **Find Max GPU Memory Utilization** (`SYSTEM=TPU` only): The script first determines the highest safe `gpu-memory-utilization` (starting from 0.98 and decreasing) that does not cause an Out-Of-Memory (OOM) error when launching the server. This ensures the benchmark runs use the maximum available memory without crashing. With `SYSTEM=GPU`, or when `GPU_MEMORY_UTILIZATION` is set, it skips this step: on CUDA and ROCm, vLLM sizes the KV cache from the memory free after warmup and defaults `gpu-memory-utilization` to 1.0.
 
 2. **Iterate and Benchmark**: It then enters a nested loop, iterating through every combination of `max-num-seqs` and `max-num-batched-tokens` provided in the configuration lists.
 

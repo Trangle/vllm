@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, is_dataclass
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.utils import has_triton_kernels
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import get_triton_kernels_version, has_triton_kernels
 
 if not has_triton_kernels():
     pytest.skip(
@@ -15,25 +16,34 @@ if not has_triton_kernels():
     )
 
 import triton_kernels.swiglu
-from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+
+if get_triton_kernels_version() == "3.8":
+    # 3.8: matmul_ogs -> matmul, matmul_ogs_details -> matmul_details
+    import triton_kernels.matmul_details.opt_flags as opt_flags
+    from triton_kernels.matmul import FlexCtx, PrecisionConfig
+else:
+    import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+    from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 from triton_kernels.numerics import InFlexData
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 from triton_kernels.testing import assert_close
 
-from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
-    BatchedPrepareAndFinalize,
-)
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
-from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
-    BatchedOAITritonExperts,
+from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a16_moe_quant_config
+from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
+    _TK38_SCATTER_COMBINE,
+    _sm12x_block_m,
+    masked_moe_sum,
     triton_kernel_moe_forward,
 )
-from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEModularKernel
-from vllm.model_executor.layers.utils import shuffle_weight
-from vllm.utils import round_up
+from vllm.model_executor.layers.fused_moe.oracle import mxfp4 as mxfp4_oracle
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
+from vllm.model_executor.layers.quantization.utils import mxfp4_utils
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mx_scale_kwargs
+from vllm.utils.math_utils import round_up
+
+from .utils import mxfp4_w_layouts, shuffle_weight
 
 
 def deshuffle(w: torch.Tensor):
@@ -96,10 +106,18 @@ def init_compute_data(M, K, N, E, a_dtype: str, w_dtype: str, num_warps: int):
     if w_dtype != "mx4":
         pytest.skip("NYI")
     else:  # quantize to mx4
-        # careful on the padding here, the activation padding need to be
-        # multiple of 64, the actual engine is not implemented
-        w1_bottom_pad = round_up(w1_tri.shape[1], 64) - w1_tri.shape[1]
-        w1_right_pad = round_up(w1_tri.shape[2], 128) - w1_tri.shape[2]
+        # Padding alignment depends on the platform.  On CDNA4 the scale
+        # swizzle requires SCALE_K % 8 == 0 (K % 256) and
+        # SCALE_N % 32 == 0 (2*N % 512), matching the production
+        # alignment in mxfp4_round_up_hidden_size_and_intermediate_size.
+        # On CUDA (Hopper) the scale layout pads internally, so the
+        # original 64/128 alignment is sufficient.
+        if current_platform.is_rocm():
+            k_align, n2_align = 256, 512
+        else:
+            k_align, n2_align = 64, 128
+        w1_bottom_pad = round_up(w1_tri.shape[1], k_align) - w1_tri.shape[1]
+        w1_right_pad = round_up(w1_tri.shape[2], n2_align) - w1_tri.shape[2]
 
         w2_bottom_pad = w1_right_pad // 2
         w2_right_pad = w1_bottom_pad
@@ -128,12 +146,12 @@ def init_compute_data(M, K, N, E, a_dtype: str, w_dtype: str, num_warps: int):
 
         x_tri = F.pad(x_tri, (0, x_pad, 0, 0), mode="constant", value=0)
 
-        w_layout, w_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
-        w_scale_layout, w_scale_layout_opts = (
-            layout.make_default_matmul_mxfp4_w_scale_layout(
-                mx_axis=1, num_warps=num_warps
-            )
-        )
+        (
+            w_layout,
+            w_layout_opts,
+            w_scale_layout,
+            w_scale_layout_opts,
+        ) = mxfp4_w_layouts(mx_axis=1, num_warps=num_warps)
 
         w1_tri, w1_scale_tri = downcast_to_mxfp(w1_tri, torch.uint8, axis=1)
         w1 = upcast_from_mxfp(w1_tri, w1_scale_tri, torch.bfloat16, axis=1)
@@ -160,10 +178,10 @@ def init_compute_data(M, K, N, E, a_dtype: str, w_dtype: str, num_warps: int):
         )
 
         pc1 = PrecisionConfig(
-            weight_scale=w1_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
+            **mx_scale_kwargs(w1_scale_tri), flex_ctx=FlexCtx(rhs_data=InFlexData())
         )
         pc2 = PrecisionConfig(
-            weight_scale=w2_scale_tri, flex_ctx=FlexCtx(rhs_data=InFlexData())
+            **mx_scale_kwargs(w2_scale_tri), flex_ctx=FlexCtx(rhs_data=InFlexData())
         )
 
         # tucuate so the rest can run properly
@@ -207,7 +225,7 @@ class ModelConfig:
     sliding_window: int = 128
     initial_context_length: int = 4096
     rope_theta: float = 150000.0
-    rope_scaling_factor: float = 32.0
+    rope_parameters_factor: float = 32.0
     rope_ntk_alpha: float = 1.0
     rope_ntk_beta: float = 32.0
 
@@ -256,7 +274,7 @@ def oai_moe_forward(
     return t
 
 
-@dataclass
+@dataclass(slots=True)
 class Case:
     a_dtype: str
     w_dtype: str
@@ -275,7 +293,10 @@ class Case:
 )
 @pytest.mark.parametrize("num_token", [2])
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
-def test_equiv(num_token, a_dtype, w_dtype, tp):
+def test_equiv(num_token, a_dtype, w_dtype, tp, workspace_init):
+    if not hasattr(layout, "make_default_matmul_mxfp4_w_layout"):
+        pytest.skip("make_default_matmul_mxfp4_w_layout not available")
+
     M = num_token
     E = ModelConfig.num_experts
     K = ModelConfig.hidden_size
@@ -299,12 +320,29 @@ def test_equiv(num_token, a_dtype, w_dtype, tp):
         pc2,
     ) = init_compute_data(M, K, N, E, a_dtype, w_dtype, num_warps=8)
 
-    quant_config = FusedMoEQuantConfig.make(
-        w1_bias=w1_bias_tri,
-        w2_bias=w2_bias_tri,
-        w1_precision=pc1,
-        w2_precision=pc2,
-    )
+    if any(
+        current_platform.is_device_capability_family(family)
+        for family in (100, 110, 120)
+    ):
+        # Mirrors `_swizzle_mxfp4`.
+        constraints = {
+            "is_persistent": True,
+            "epilogue_subtile": 1,
+        }
+        opt_flags.update_opt_flags_constraints(constraints)
+
+    if a_dtype == "bf16" and w_dtype == "mx4":
+        quant_config = mxfp4_w4a16_moe_quant_config(
+            w1_scale=pc1,
+            w2_scale=pc2,
+            w1_bias=w1_bias_tri,
+            w2_bias=w2_bias_tri,
+        )
+    else:
+        raise NotImplementedError(
+            f"Quantization configuration for activation={a_dtype} and weight={w_dtype} "
+            f"has not been implemented."
+        )
 
     out_triton_monolithic = triton_kernel_moe_forward(
         hidden_states=x_tri,
@@ -329,113 +367,63 @@ def test_equiv(num_token, a_dtype, w_dtype, tp):
     assert_close(ref=out_ref, tri=out_triton_monolithic, maxtol=0.025, rmstol=0.005)
 
 
-def batched_moe(
-    a: torch.Tensor,
-    w1,
-    w2,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    w1_bias: torch.Tensor,
-    w2_bias: torch.Tensor,
-    w1_precision: PrecisionConfig,
-    w2_precision: PrecisionConfig,
-) -> torch.Tensor:
-    max_num_tokens = round_up(a.shape[0], 64)
-
-    quant_config = FusedMoEQuantConfig.make(
-        w1_precision=w1_precision,
-        w2_precision=w2_precision,
-        w1_bias=w1_bias,
-        w2_bias=w2_bias,
-    )
-
-    fused_experts = FusedMoEModularKernel(
-        BatchedPrepareAndFinalize(
-            max_num_tokens,
-            num_dispatchers=1,
-            num_local_experts=w1.shape[0],
-            rank=0,
-        ),
-        BatchedOAITritonExperts(
-            max_num_tokens=max_num_tokens,
-            num_dispatchers=1,
-            quant_config=quant_config,
-        ),
-    )
-
-    topk_weight, topk_ids, _ = fused_topk(a, gating_output, topk, renormalize)
-
-    return fused_experts(
-        a,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-    )
+@pytest.mark.parametrize(
+    ("num_rows", "num_experts", "expected"),
+    [
+        (4, 32, 16),  # bs=1 decode: below the 16-row floor
+        (32 * 20, 32, 32),  # 20 tokens/expert rounds up to 32
+        (32 * 33, 32, 32),  # heuristic would pick 64; capped for 99KB smem
+        (12000, 32, 32),  # prefill: heuristic would pick 128
+    ],
+)
+def test_sm12x_block_m(num_rows, num_experts, expected):
+    assert _sm12x_block_m(num_rows, num_experts) == expected
 
 
 @pytest.mark.parametrize(
-    ", ".join(f.name for f in fields(Case)),
-    [
-        tuple(getattr(case, f.name) for f in fields(Case))
-        for case in [
-            # Case(a_dtype="bf16", w_dtype="bf16"),
-            # Case(a_dtype="fp8_e4m3", w_dtype="fp8_e5m2"),
-            Case(a_dtype="bf16", w_dtype="mx4")
-        ]
-    ],
+    ("family", "marlin_first"), [(None, False), (100, False), (110, True), (120, True)]
 )
-@pytest.mark.parametrize("num_token", [64])
-@pytest.mark.parametrize("ep", [1, 2, 4, 8])
-def test_triton_kernel_batched_moe(num_token, a_dtype, w_dtype, ep):
-    M = num_token
-    E = ModelConfig.num_experts // ep
-    K = ModelConfig.hidden_size
-    N = ModelConfig.intermediate_size
-    topk = ModelConfig.experts_per_token
-
-    (
-        x,
-        w1,
-        w1_bias,
-        w2,
-        w2_bias,
-        exp_data,
-        x_tri,
-        w1_tri,
-        w2_tri,
-        exp_data_tri,
-        w1_bias_tri,
-        w2_bias_tri,
-        pc1,
-        pc2,
-    ) = init_compute_data(M, K, N, E, a_dtype, w_dtype, num_warps=4)
-
-    out_tri = batched_moe(
-        a=x_tri,
-        w1=w1_tri,
-        w2=w2_tri,
-        gating_output=exp_data_tri,
-        topk=topk,
-        renormalize=True,
-        w1_bias=w1_bias_tri,
-        w2_bias=w2_bias_tri,
-        w1_precision=pc1,
-        w2_precision=pc2,
+def test_gpt_oss_priority_triton_vs_marlin(
+    monkeypatch: pytest.MonkeyPatch, family: int | None, marlin_first: bool
+):
+    """MARLIN stays the default on SM110 (unbenchmarked) and SM12x (small tiles
+    only) while TRITON remains selectable explicitly."""
+    monkeypatch.setattr(mxfp4_oracle.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        mxfp4_oracle.current_platform,
+        "is_device_capability_family",
+        lambda f: f == family,
     )
-    out_tri = out_tri[..., :K]
-
-    out_ref = oai_moe_forward(
-        hidden_states=x,
-        w1=w1,
-        w1_bias=w1_bias,
-        w2=w2,
-        w2_bias=w2_bias,
-        gating_output=exp_data,
-        topk=topk,
+    order = mxfp4_oracle._get_priority_backends_for_gpt_oss()
+    triton_first = order.index(Mxfp4MoeBackend.TRITON) < order.index(
+        Mxfp4MoeBackend.MARLIN
     )
-    assert_close(ref=out_ref, tri=out_tri, maxtol=0.025, rmstol=0.005)
+    assert triton_first is not marlin_first
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only constraints")
+@pytest.mark.parametrize("family", [110, 120])
+def test_swizzle_mxfp4_pins_epilogue_subtile(
+    monkeypatch: pytest.MonkeyPatch, family: int
+):
+    """Without epilogue_subtile=1 the opt_flags heuristic picks a subtiled
+    epilogue with SWAP_XW, which fails to compile in matmul_ogs (#61374)."""
+    monkeypatch.setattr(
+        mxfp4_utils.current_platform, "is_device_capability", lambda cap: False
+    )
+    monkeypatch.setattr(
+        mxfp4_utils.current_platform,
+        "is_device_capability_family",
+        lambda f: f == family,
+    )
+    monkeypatch.setattr(opt_flags, "_opt_flags_constraints", {})
+    w = torch.zeros(1, 256, 128, dtype=torch.uint8, device="cuda")
+    scale = torch.zeros(1, 256, 8, dtype=torch.uint8, device="cuda")
+    mxfp4_utils._swizzle_mxfp4(w, scale)
+    assert opt_flags._opt_flags_constraints == {
+        "is_persistent": True,
+        "epilogue_subtile": 1,
+    }
 
 
 def test_unit_shuffle():
@@ -458,3 +446,164 @@ def test_unit_shuffle():
     )
 
     assert_close(ref=out_ref, tri=out)
+
+
+@pytest.mark.parametrize("n_tokens", [1, 33, 512])
+@pytest.mark.parametrize("n_experts,topk", [(32, 4), (128, 4)])
+def test_routing_data_from_sparse_topk_parity(n_tokens, n_experts, topk):
+    """routing_data_from_sparse_topk must produce routing structures
+    identical to make_routing_data for the same topk result."""
+    from vllm.model_executor.layers.fused_moe.experts import (
+        gpt_oss_triton_kernels_moe as gptoss_moe,
+    )
+
+    make_routing_data = gptoss_moe.make_routing_data
+    routing_data_from_sparse_topk = gptoss_moe.routing_data_from_sparse_topk
+
+    if gptoss_moe.triton_kernels_version == "3.5.1":
+        pytest.skip("SparseMatrix path requires triton_kernels v3.6.0+")
+
+    from triton_kernels.topk import topk as topk_fn
+
+    torch.manual_seed(0)
+    logits = torch.randn(n_tokens, n_experts, dtype=torch.bfloat16, device="cuda")
+    sparse_topk = topk_fn(logits, topk, apply_softmax=True)
+    assert not isinstance(sparse_topk, tuple)
+
+    rd_new, gather_new, scatter_new = routing_data_from_sparse_topk(
+        sparse_topk, n_experts
+    )
+    rd_ref, gather_ref, scatter_ref = make_routing_data(
+        sparse_topk.indx.to(torch.long), sparse_topk.vals, n_experts
+    )
+
+    def assert_equivalent(new, ref, path="RoutingData"):
+        """Recursively compare tensor-valued leaves of routing structures."""
+        if isinstance(ref, torch.Tensor):
+            torch.testing.assert_close(new, ref, msg=lambda m: f"{path}: {m}")
+        elif isinstance(ref, (int, float, bool, str)) or ref is None:
+            assert new == ref, f"{path}: {new!r} != {ref!r}"
+        elif is_dataclass(ref):
+            for f in fields(ref):
+                assert_equivalent(
+                    getattr(new, f.name), getattr(ref, f.name), f"{path}.{f.name}"
+                )
+        elif callable(ref):
+            assert callable(new), f"{path}: callable vs {type(new)}"
+        elif hasattr(ref, "__dict__"):
+            for k, v in vars(ref).items():
+                assert_equivalent(getattr(new, k), v, f"{path}.{k}")
+        elif hasattr(type(ref), "__slots__"):
+            for k in type(ref).__slots__:
+                assert_equivalent(getattr(new, k), getattr(ref, k), f"{path}.{k}")
+        else:
+            assert type(new) is type(ref), f"{path}: {type(new)} vs {type(ref)}"
+
+    assert_equivalent(rd_new, rd_ref)
+    if isinstance(gather_ref, torch.Tensor):
+        torch.testing.assert_close(gather_new, gather_ref)
+        torch.testing.assert_close(scatter_new, scatter_ref)
+        return
+    torch.testing.assert_close(gather_new.src_indx, gather_ref.src_indx)
+    torch.testing.assert_close(gather_new.dst_indx, gather_ref.dst_indx)
+    torch.testing.assert_close(scatter_new.src_indx, scatter_ref.src_indx)
+    torch.testing.assert_close(scatter_new.dst_indx, scatter_ref.dst_indx)
+
+
+@pytest.mark.parametrize("n_tokens", [1, 33, 4099])
+@pytest.mark.parametrize("n_experts,topk", [(128, 4), (256, 6)])
+def test_make_routing_data_tk38_matches_reference(n_tokens, n_experts, topk):
+    from vllm.model_executor.layers.fused_moe.experts import (
+        gpt_oss_triton_kernels_moe as gptoss_moe,
+    )
+
+    if gptoss_moe.triton_kernels_version != "3.8":
+        pytest.skip("requires triton_kernels 3.8")
+
+    torch.manual_seed(0)
+    topk_ids = torch.stack(
+        [torch.randperm(n_experts, device="cuda")[:topk] for _ in range(n_tokens)]
+    ).to(torch.int32)
+    topk_ids[torch.rand(topk_ids.shape, device="cuda") < 0.5] = -1
+    topk_weights = torch.rand(topk_ids.shape, device="cuda")
+
+    routing, gather_tok, scatter_tok = gptoss_moe.make_routing_data(
+        topk_ids, topk_weights, n_experts
+    )
+
+    flat = topk_ids.reshape(-1).to(torch.int64)
+    order = torch.argsort(flat.clamp(min=0), stable=True)
+    counts = torch.bincount(flat.clamp(min=0), minlength=n_experts).to(torch.int32)
+    weights = topk_weights.reshape(-1) * (flat >= 0).to(torch.float32)
+
+    assert torch.equal(routing.ragged.slice_sizes, counts)
+    assert torch.equal(gather_tok, (order // topk).to(torch.int32))
+    assert torch.equal(scatter_tok, gather_tok)
+    assert torch.equal(routing.gate_scal, weights[order])
+    assert routing.n_expts_act == topk
+    assert routing.n_valid == flat.numel()
+
+
+requires_rdna_scatter_combine = pytest.mark.skipif(
+    not _TK38_SCATTER_COMBINE, reason="scatter + topk-sum combine is RDNA-only"
+)
+
+
+@requires_rdna_scatter_combine
+@pytest.mark.parametrize("num_token", [1, 33, 512])
+@pytest.mark.parametrize("use_expert_map", [False, True])
+def test_tk38_scatter_combine_matches_index_add(
+    num_token, use_expert_map, monkeypatch, workspace_init
+):
+    """The scatter + topk-sum combine must match the index_add combine,
+    including the -1 (non-local) slots of an expert map."""
+    from vllm.model_executor.layers.fused_moe.experts import (
+        gpt_oss_triton_kernels_moe as gptoss_moe,
+    )
+
+    # test_equiv leaves its SM12x is_persistent constraint set on gfx12
+    opt_flags.reset_opt_flags_constraints()
+    M, E, topk = num_token, 32, ModelConfig.experts_per_token
+    K, N = ModelConfig.hidden_size, ModelConfig.intermediate_size
+    (*_, x_tri, w1_tri, w2_tri, exp_data_tri, w1_bias_tri, w2_bias_tri, pc1, pc2) = (
+        init_compute_data(M, K, N, E, "bf16", "mx4", num_warps=8)
+    )
+    quant_config = mxfp4_w4a16_moe_quant_config(
+        w1_scale=pc1, w2_scale=pc2, w1_bias=w1_bias_tri, w2_bias=w2_bias_tri
+    )
+    gating, expert_map, global_num_experts = exp_data_tri, None, -1
+    if use_expert_map:
+        # Twice as many global experts; only the first E are local.
+        torch.manual_seed(0)
+        gating = torch.randn((M, 2 * E), dtype=torch.bfloat16, device="cuda")
+        expert_map = torch.full((2 * E,), -1, dtype=torch.int32, device="cuda")
+        expert_map[:E] = torch.arange(E, dtype=torch.int32, device="cuda")
+        global_num_experts = 2 * E
+
+    def run(scatter_combine: bool) -> torch.Tensor:
+        monkeypatch.setattr(gptoss_moe, "_TK38_SCATTER_COMBINE", scatter_combine)
+        return triton_kernel_moe_forward(
+            hidden_states=x_tri,
+            w1=w1_tri,
+            w2=w2_tri,
+            gating_output=gating,
+            topk=topk,
+            renormalize=True,
+            quant_config=quant_config,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+        )
+
+    out_index_add = run(False)
+    out_scatter = run(True)
+    torch.testing.assert_close(out_scatter, out_index_add, atol=1e-2, rtol=1e-2)
+
+
+@requires_rdna_scatter_combine
+def test_masked_moe_sum_without_topk_ids():
+    torch.manual_seed(0)
+    M, topk, K = 37, 4, 2880
+    inp = torch.randn((M, topk, K), dtype=torch.bfloat16, device="cuda")
+    out = torch.empty((M, K), dtype=torch.bfloat16, device="cuda")
+    masked_moe_sum(inp, None, out)
+    torch.testing.assert_close(out, inp.float().sum(dim=1).to(torch.bfloat16))

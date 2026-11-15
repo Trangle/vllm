@@ -6,13 +6,13 @@ import time
 import pytest
 
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.openai.api_server import (
+from vllm.entrypoints.launchers.api_server.entry import (
     build_async_engine_client_from_engine_args,
 )
 from vllm.inputs import TextPrompt
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
-from vllm.utils import merge_async_iterators
+from vllm.utils.async_utils import merge_async_iterators
 
 MODEL_PATH = "zai-org/chatglm3-6b"
 LORA_RANK = 64
@@ -38,7 +38,7 @@ async def requests_processing_time(llm, lora_requests: list[LoRARequest]) -> flo
     for lora_request in lora_requests:
         lora_int_id = lora_request.lora_int_id
         generator = llm.generate(
-            prompt=TextPrompt(prompt=f"hello {lora_int_id}", multi_modal_data=None),  # type: ignore
+            prompt=TextPrompt(prompt=f"hello {lora_int_id}", multi_modal_data=None),
             sampling_params=sampling_params,
             lora_request=lora_request,
             request_id=f"test{lora_int_id}",
@@ -46,7 +46,7 @@ async def requests_processing_time(llm, lora_requests: list[LoRARequest]) -> flo
         generators.append(generator)
 
     all_gens = merge_async_iterators(*generators)
-    async for i, res in all_gens:
+    async for _ in all_gens:
         pass
 
     end = time.perf_counter()
@@ -55,8 +55,7 @@ async def requests_processing_time(llm, lora_requests: list[LoRARequest]) -> flo
 
 @pytest.mark.asyncio
 async def test_add_lora(chatglm3_lora_files):
-    """
-    The add_lora function is used to preload some LoRA adapters into the
+    """The add_lora function is used to preload some LoRA adapters into the
     engine in anticipation of future requests using these adapters. To test
     this functionality, we use the async engine to process some requests - We
     do it twice, once with add_lora() preloading and once without.

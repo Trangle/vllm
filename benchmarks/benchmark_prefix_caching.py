@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Benchmark the efficiency of prefix caching.
+"""Benchmark the efficiency of prefix caching.
 
 This script allows you to benchmark the performance of
 a model with and without prefix caching using either fixed prompts
@@ -37,10 +36,10 @@ from transformers import PreTrainedTokenizerBase
 
 from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import EngineArgs
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 try:
-    from vllm.transformers_utils.tokenizer import get_tokenizer
+    from vllm.tokenizers import get_tokenizer
 except ImportError:
     from backend_request_func import get_tokenizer
 
@@ -56,7 +55,7 @@ def test_prefix(llm=None, sampling_params=None, prompts=None):
     print(f"cost time {end_time - start_time}")
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class Request:
     prompt: str
     prompt_len: int
@@ -69,7 +68,7 @@ def sample_tokens(tokenizer: PreTrainedTokenizerBase, length: int) -> list[int]:
 
     # Remove the special tokens.
     return random.choices(
-        [v for k, v in vocab.items() if k not in all_special_ids],
+        [v for v in vocab.values() if v not in all_special_ids],
         k=length,
     )
 
@@ -134,7 +133,7 @@ def sample_requests_from_random(
     prefix_token_ids = sample_tokens(tokenizer, prefix_len)
     min_len, max_len = input_length_range
 
-    for i in range(num_requests):
+    for _ in range(num_requests):
         unique_part_token_ids = sample_tokens(
             tokenizer, random.randint(min_len - prefix_len, max_len - prefix_len)
         )
@@ -196,7 +195,7 @@ def main(args):
 
     engine_args = EngineArgs.from_cli_args(args)
 
-    llm = LLM(**dataclasses.asdict(engine_args))
+    llm = LLM.from_engine_args(engine_args)
 
     sampling_params = SamplingParams(
         temperature=0,

@@ -3,27 +3,43 @@
 
 from collections.abc import Callable
 from fractions import Fraction
-from functools import cache, partial
-from typing import Any
 
 import torch
-import torch.nn.functional as F
 
-from vllm import envs
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    dequant_mxfp4,
-    quant_dequant_mxfp4,
+from vllm.model_executor.kernels.linear import (
+    MxFp4LinearKernel,
+    MxFp6LinearKernel,
+    Mxfp8LinearKernel,
+    init_mxfp4_linear_kernel,
+    init_mxfp6_linear_kernel,
+    init_mxfp8_linear_kernel,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp6_utils import (
-    dequant_mxfp6,
-    quant_dequant_mxfp6,
+from vllm.model_executor.layers.fusion.quant_activation import (
+    expose_input_quant_key,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_SCALE_DTYPE,
+    MXFP8_VALUE_DTYPE,
 )
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
+    _ACTIVATION_QUANT_KEY_MAP,
+    _WEIGHT_QUANT_KEY_MAP,
     OCP_MX_BLOCK_SIZE,
-    OCP_MX_Scheme,
+    OCP_MX_UNPACKED_DTYPES,
 )
-from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey,
+    kMxfp4Static,
+    kMxfp6E2M3Static,
+    kMxfp6E3M2Static,
+    kMxfp8Static,
+)
+from vllm.model_executor.parameter import (
+    GroupQuantScaleParameter,
+    ModelWeightParameter,
+    PackedvLLMParameter,
+)
 from vllm.platforms import current_platform
 
 from .quark_scheme import QuarkScheme
@@ -31,142 +47,48 @@ from .quark_scheme import QuarkScheme
 logger = init_logger(__name__)
 
 
-@cache
-def is_rocm_aiter_fp4_asm_gemm_enabled() -> bool:
-    return (
-        current_platform.is_rocm()
-        and envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
-        and envs.VLLM_ROCM_USE_AITER
-    )
-
-
-try:
-    from aiter.ops.shuffle import shuffle_weight
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-
-    from vllm.utils import direct_register_custom_op
-
-    if is_rocm_aiter_fp4_asm_gemm_enabled():
-        from aiter import gemm_a4w4, per_1x32_f4_quant_hip
-
-    def gemm_with_dynamic_quant(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-        rocm_use_aiter_fp4_asm_gemm: bool = False,
-        out_dtype: torch.dtype | None = torch.bfloat16,
-        x_scales: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        M = x.shape[0]
-        if rocm_use_aiter_fp4_asm_gemm:
-            if x_scales is None:
-                # use hip quant kernel for performance
-                x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
-            else:
-                x_q = x
-                x_s = x_scales
-
-            # 32 alignment is enough for dim0 padding of output for
-            # gemm_a4w4 kernel
-            y = torch.empty(
-                (M + 31) // 32 * 32, weight.shape[0], device=x_q.device, dtype=out_dtype
-            )
-
-            gemm_a4w4(
-                x_q, weight, x_s, weight_scale.view(x_s.dtype), y, bpreshuffle=True
-            )
-            return y[:M]
-        else:
-            if x_scales is None:
-                x_q, x_s = dynamic_mxfp4_quant(x)
-            else:
-                x_q = x
-                x_s = x_scales
-            y = torch.empty(
-                x_q.shape[0], weight.shape[0], device=x_q.device, dtype=out_dtype
-            )
-
-            gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, y)
-            return y
-
-    def gemm_with_dynamic_quant_fake(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-        x_scales: torch.Tensor = None,
-        rocm_use_aiter_fp4_asm_gemm: bool = False,
-        out_dtype: torch.dtype | None = torch.bfloat16,
-    ) -> torch.Tensor:
-        return torch.empty(
-            (*x.shape[:-1], weight.shape[0]), dtype=out_dtype, device=x.device
-        )
-
-    direct_register_custom_op(
-        op_name="gemm_with_dynamic_quant",
-        op_func=gemm_with_dynamic_quant,
-        mutates_args=[],
-        fake_impl=gemm_with_dynamic_quant_fake,
-        dispatch_key=current_platform.dispatch_key,
-    )
-except (ImportError, AttributeError):
-    dynamic_mxfp4_quant = gemm_afp4wfp4 = None
-
-
 class QuarkOCP_MX(QuarkScheme):
+    ocp_mx_linear: MxFp6LinearKernel | MxFp4LinearKernel | Mxfp8LinearKernel
+    supported_activation_quant_keys = [*_ACTIVATION_QUANT_KEY_MAP.values(), None]
+    supported_weight_quant_keys = [*_WEIGHT_QUANT_KEY_MAP.values()]
+
     def __init__(
-        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
+        self,
+        weight_quant_key: QuantKey,
+        activation_quant_key: QuantKey | None,
+        scale_block_rows: int = 1,
     ):
-        self.out_dtype = torch.get_default_dtype()
-        self.qscheme = "per_group"
-        self.weight_quant_spec = weight_quant_spec
-        self.input_quant_spec = input_quant_spec
-
-        self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
-        self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
-
-        self.ocp_mx_scheme = OCP_MX_Scheme.from_quant_dtype(
-            self.input_dtype, self.weight_dtype
+        super().__init__(weight_quant_key, activation_quant_key)
+        self.scale_block_rows = scale_block_rows
+        self.weight_dtype = next(
+            dtype
+            for dtype, quant_key in _WEIGHT_QUANT_KEY_MAP.items()
+            if quant_key == weight_quant_key
+        )
+        self.input_dtype = (
+            next(
+                dtype
+                for dtype, quant_key in _ACTIVATION_QUANT_KEY_MAP.items()
+                if quant_key == activation_quant_key
+            )
+            if activation_quant_key is not None
+            else None
         )
 
-        if self.weight_dtype == "mxfp4":
-            self.packed_factor: int | Fraction = 2
-            self.dequant_func = dequant_mxfp4
+        self.is_unpacked = self.weight_dtype in OCP_MX_UNPACKED_DTYPES
+
+        if self.is_unpacked:
+            self.packed_factor: int | Fraction = 1
+        elif self.weight_dtype == "mxfp4":
+            self.packed_factor = 2
         else:
             self.packed_factor = Fraction(numerator=8, denominator=6)
-            self.dequant_func = partial(
-                dequant_mxfp6, quant_dtype=self.weight_dtype.replace("mx", "")
-            )
 
-        if self.input_dtype == "mxfp4":
-            self.quant_dequant_func = quant_dequant_mxfp4
-        else:
-            self.quant_dequant_func = partial(
-                quant_dequant_mxfp6, quant_dtype=self.input_dtype.replace("mx", "")
-            )
-
-        self.static_input_scales = not input_quant_spec.get("is_dynamic")
-
-        if self.static_input_scales:
-            raise NotImplementedError(
-                "QuarkOCP_MX with static input scales is currently not "
-                "implemented. Please open an issue."
-            )
-
-        # TODO: integrate (or test) mixed-precision kernel.
-        self.emulate = not current_platform.supports_mx() or (
-            self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4"
-        )
-
-        self.rocm_use_aiter_fp4_asm_gemm = is_rocm_aiter_fp4_asm_gemm_enabled()
-
-        if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):
-            # Currently need these kernels if not emulating
-            raise NotImplementedError(
-                f"{self.__class__.__name__} requires AITER to be installed "
-                "for non-emulation mode! Please refer to "
-                "https://github.com/ROCm/aiter for installation details."
-            )
+        if self.is_unpacked:
+            # MXFP8 runs on the shared kernel abstraction, which picks a native
+            # backend where one exists and emulates otherwise. The MXFP4/MXFP6
+            # warnings below do not apply.
+            return
 
         if not current_platform.supports_mx():
             logger.warning_once(
@@ -189,7 +111,9 @@ class QuarkOCP_MX(QuarkScheme):
             )
 
     def get_packed_dim(self, dim: int, quant_dtype: str):
-        if quant_dtype == "mxfp4":
+        if quant_dtype in OCP_MX_UNPACKED_DTYPES:
+            return dim
+        elif quant_dtype == "mxfp4":
             assert dim % 2 == 0
             return dim // 2
         elif quant_dtype in {"mxfp6_e3m2", "mxfp6_e2m3"}:
@@ -203,41 +127,32 @@ class QuarkOCP_MX(QuarkScheme):
                 "open an issue."
             )
 
+    def _expanding_scale_loader(self, weight_loader: Callable) -> Callable:
+        """Expand a 2-D block scale to one row per weight row.
+
+        A `block_size=[R, 32]` export carries one e8m0 value per R weight
+        rows; the kernels want one per row. At `R == 1` the layouts already
+        coincide, so the loader is passed through untouched.
+        """
+        if self.scale_block_rows == 1:
+            return weight_loader
+
+        rows = self.scale_block_rows
+
+        def expanding_loader(param, loaded_weight, *args, **kwargs):
+            loaded_weight = loaded_weight.view(torch.uint8).repeat_interleave(
+                rows, dim=0
+            )
+            return weight_loader(param, loaded_weight, *args, **kwargs)
+
+        return expanding_loader
+
     @classmethod
     def get_min_capability(cls) -> int:
         return 70
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
-
-        if self.emulate:
-            layer.weight_scale = torch.nn.Parameter(
-                layer.weight_scale.data, requires_grad=False
-            )
-        else:
-            if self.rocm_use_aiter_fp4_asm_gemm:
-                # shuffle weight scale
-                weight_scale_shuffle = layer.weight_scale.data
-                sm, sn = weight_scale_shuffle.shape
-                weight_scale_shuffle = weight_scale_shuffle.view(
-                    sm // 32, 2, 16, sn // 8, 2, 4, 1
-                )
-                weight_scale_shuffle = weight_scale_shuffle.permute(
-                    0, 3, 5, 2, 4, 1, 6
-                ).contiguous()
-                weight_scale_shuffle = weight_scale_shuffle.view(sm, sn)
-                layer.weight_scale = torch.nn.Parameter(
-                    weight_scale_shuffle, requires_grad=False
-                )
-
-                # shuffle weight
-                weight_shuffle = layer.weight.data
-                weight_shuffle = shuffle_weight(weight_shuffle, layout=(16, 16))
-                layer.weight = torch.nn.Parameter(weight_shuffle, requires_grad=False)
-            else:
-                layer.weight_scale = torch.nn.Parameter(
-                    layer.weight_scale.data.T.contiguous(), requires_grad=False
-                )
+        self.ocp_mx_linear.process_weights_after_loading(layer)
 
     def create_weights(
         self,
@@ -248,36 +163,101 @@ class QuarkOCP_MX(QuarkScheme):
         weight_loader: Callable,
         **kwargs,
     ):
-        output_size_per_partition = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
+        if input_size_per_partition % OCP_MX_BLOCK_SIZE != 0:
+            layer_name = getattr(layer, "prefix", "") or type(layer).__name__
+            raise ValueError(
+                f"OCP MX linear layer {layer_name!r} has an input size per "
+                f"partition of {input_size_per_partition}, which must be "
+                f"divisible by the OCP MX group size {OCP_MX_BLOCK_SIZE}. "
+                "Choose a compatible tensor-parallel size or avoid "
+                "tensor-parallel sharding for this layer."
+            )
 
-        # WEIGHT
-        weight = PackedvLLMParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                self.get_packed_dim(input_size_per_partition, self.weight_dtype),
-                dtype=torch.uint8,
-            ),
-            input_dim=1,
-            output_dim=0,
-            packed_dim=1,
-            packed_factor=self.packed_factor,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
+        if self.is_unpacked:
+            output_size_per_partition = sum(output_partition_sizes)
+            layer.logical_widths = output_partition_sizes
+            layer.input_size_per_partition = input_size_per_partition
+            layer.output_size_per_partition = output_size_per_partition
+            layer.params_dtype = params_dtype
 
-        # WEIGHT SCALE
-        weight_scale = GroupQuantScaleParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // OCP_MX_BLOCK_SIZE,
-                dtype=torch.uint8,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=MXFP8_VALUE_DTYPE,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
+
+            weight_scale = GroupQuantScaleParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // OCP_MX_BLOCK_SIZE,
+                    dtype=MXFP8_SCALE_DTYPE,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=self._expanding_scale_loader(weight_loader),
+            )
+            layer.register_parameter("weight_scale", weight_scale)
+            layer.weight_block_size = [1, OCP_MX_BLOCK_SIZE]
+        else:
+            output_size_per_partition = sum(output_partition_sizes)
+            layer.logical_widths = output_partition_sizes
+
+            # WEIGHT
+            weight = PackedvLLMParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    self.get_packed_dim(input_size_per_partition, self.weight_dtype),
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                packed_dim=1,
+                packed_factor=self.packed_factor,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
+
+            # WEIGHT SCALE
+            weight_scale = GroupQuantScaleParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // OCP_MX_BLOCK_SIZE,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_scale", weight_scale)
+
+        if self.weight_quant_key == kMxfp4Static:
+            self.ocp_mx_linear = init_mxfp4_linear_kernel(
+                activation_quant_key=self.activation_quant_key,
+            )
+        elif self.weight_quant_key in [kMxfp6E2M3Static, kMxfp6E3M2Static]:
+            self.ocp_mx_linear = init_mxfp6_linear_kernel(
+                weight_quant_key=self.weight_quant_key,
+                activation_quant_key=self.activation_quant_key,
+            )
+        elif self.weight_quant_key == kMxfp8Static:
+            self.ocp_mx_linear = init_mxfp8_linear_kernel(
+                weight_shape=layer.weight.shape,
+                activation_quant_key=self.activation_quant_key,
+            )
+            if current_platform.is_rocm():
+                expose_input_quant_key(layer, self.ocp_mx_linear)
+        else:
+            raise NotImplementedError(
+                "No OCP MX linear kernel for weight_quant_key="
+                f"{self.weight_quant_key}. Something is wrong, please open an "
+                "issue."
+            )
 
     def apply_weights(
         self,
@@ -285,15 +265,4 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.emulate:
-            dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
-            qdq_x = self.quant_dequant_func(x)
-            return F.linear(qdq_x, dq_w, bias)
-        else:
-            return torch.ops.vllm.gemm_with_dynamic_quant(
-                x,
-                layer.weight,
-                layer.weight_scale,
-                self.rocm_use_aiter_fp4_asm_gemm,
-                self.out_dtype,
-            )
+        return self.ocp_mx_linear.apply_weights(layer, x, bias)

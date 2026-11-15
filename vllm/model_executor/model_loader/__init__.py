@@ -9,10 +9,11 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
-from vllm.model_executor.model_loader.bitsandbytes_loader import BitsAndBytesModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
+from vllm.model_executor.model_loader.modelexpress_loader import (
+    ModelExpressModelLoader,
+)
 from vllm.model_executor.model_loader.runai_streamer_loader import (
     RunaiModelStreamerLoader,
 )
@@ -23,6 +24,7 @@ from vllm.model_executor.model_loader.utils import (
     get_model_architecture,
     get_model_cls,
 )
+from vllm.model_executor.model_loader.weight_cache.ipc_loader import IpcModelLoader
 
 logger = init_logger(__name__)
 
@@ -30,11 +32,13 @@ logger = init_logger(__name__)
 # if a new load format is added here
 LoadFormats = Literal[
     "auto",
-    "bitsandbytes",
+    "hf",
     "dummy",
     "fastsafetensors",
-    "gguf",
+    "instanttensor",
+    "ipc_cache",
     "mistral",
+    "modelexpress",
     "npcache",
     "pt",
     "runai_streamer",
@@ -45,11 +49,13 @@ LoadFormats = Literal[
 ]
 _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "auto": DefaultModelLoader,
-    "bitsandbytes": BitsAndBytesModelLoader,
+    "hf": DefaultModelLoader,
     "dummy": DummyModelLoader,
     "fastsafetensors": DefaultModelLoader,
-    "gguf": GGUFModelLoader,
+    "instanttensor": DefaultModelLoader,
+    "ipc_cache": IpcModelLoader,
     "mistral": DefaultModelLoader,
+    "modelexpress": ModelExpressModelLoader,
     "npcache": DefaultModelLoader,
     "pt": DefaultModelLoader,
     "runai_streamer": RunaiModelStreamerLoader,
@@ -88,6 +94,7 @@ def register_model_loader(load_format: str):
         >>> load_config = LoadConfig(load_format="my_loader")
         >>> type(get_model_loader(load_config))
         <class 'MyModelLoader'>
+
     """  # noqa: E501
 
     def _wrapper(model_loader_cls):
@@ -122,12 +129,18 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
 
 def get_model(
-    *, vllm_config: VllmConfig, model_config: ModelConfig | None = None
+    *,
+    vllm_config: VllmConfig,
+    model_config: ModelConfig | None = None,
+    prefix: str = "",
+    load_config: LoadConfig | None = None,
 ) -> nn.Module:
-    loader = get_model_loader(vllm_config.load_config)
+    loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
-    return loader.load_model(vllm_config=vllm_config, model_config=model_config)
+    return loader.load_model(
+        vllm_config=vllm_config, model_config=model_config, prefix=prefix
+    )
 
 
 __all__ = [
@@ -138,10 +151,10 @@ __all__ = [
     "get_model_cls",
     "register_model_loader",
     "BaseModelLoader",
-    "BitsAndBytesModelLoader",
-    "GGUFModelLoader",
+    "ModelExpressModelLoader",
     "DefaultModelLoader",
     "DummyModelLoader",
+    "IpcModelLoader",
     "RunaiModelStreamerLoader",
     "ShardedStateLoader",
     "TensorizerLoader",

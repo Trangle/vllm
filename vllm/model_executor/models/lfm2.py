@@ -1,57 +1,66 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 from itertools import islice
-from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import Lfm2Config
 
-from vllm.attention import Attention
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.attention import Attention, EncoderOnlyAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
+    MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.mamba.short_conv import ShortConv
+from vllm.model_executor.layers.pooler.seqwise import pooler_for_embed
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import HasInnerState, IsHybrid, SupportsLoRA, SupportsPP, SupportsQuant
+from .interfaces_base import attn_type, default_pooling_type
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 class Lfm2MLP(nn.Module):
     def __init__(
         self,
         dim: int,
-        ff_dim: int,
+        intermediate_size: int,
         multiple_of: int,
         auto_adjust_ff_dim: bool,
         ffn_dim_multiplier: float | None,
@@ -60,21 +69,23 @@ class Lfm2MLP(nn.Module):
     ):
         super().__init__()
         if auto_adjust_ff_dim:
-            ff_dim = int(2 * ff_dim / 3)
+            intermediate_size = int(2 * intermediate_size / 3)
             # custom dim factor multiplier
             if ffn_dim_multiplier is not None:
-                ff_dim = int(ffn_dim_multiplier * ff_dim)
-            ff_dim = multiple_of * ((ff_dim + multiple_of - 1) // multiple_of)
+                intermediate_size = int(ffn_dim_multiplier * intermediate_size)
+            intermediate_size = multiple_of * (
+                (intermediate_size + multiple_of - 1) // multiple_of
+            )
 
-        self.w1 = MergedColumnParallelLinear(
+        self.w13 = MergedColumnParallelLinear(
             input_size=dim,
-            output_sizes=[ff_dim] * 2,
+            output_sizes=[intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.w1",
+            prefix=f"{prefix}.w13",
         )
         self.w2 = RowParallelLinear(
-            input_size=ff_dim,
+            input_size=intermediate_size,
             output_size=dim,
             bias=False,
             quant_config=quant_config,
@@ -83,7 +94,7 @@ class Lfm2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.w1(x)
+        gate_up, _ = self.w13(x)
         x = self.act_fn(gate_up)
         x, _ = self.w2(x)
         return x
@@ -97,12 +108,11 @@ class Lfm2Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_theta: float = 10000,
-        rope_scaling: dict[str, Any] | None = None,
         max_position_embeddings: int = 8192,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        bidirectional: bool = False,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -127,7 +137,6 @@ class Lfm2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
@@ -148,13 +157,12 @@ class Lfm2Attention(nn.Module):
         )
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
-            base=self.rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=config.rope_parameters,
             is_neox_style=True,
         )
-        self.attn = Attention(
+        attention_cls = EncoderOnlyAttention if bidirectional else Attention
+        self.attn = attention_cls(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -173,8 +181,8 @@ class Lfm2Attention(nn.Module):
         n_tokens, _ = hidden_states.shape
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(n_tokens, self.num_heads, self.head_dim).contiguous()
-        k = k.view(n_tokens, self.num_kv_heads, self.head_dim).contiguous()
+        q = q.view(n_tokens, self.num_heads, self.head_dim)
+        k = k.view(n_tokens, self.num_kv_heads, self.head_dim)
         q = self.q_layernorm(q)
         k = self.k_layernorm(k)
         q, k = self.rotary_emb(positions, q, k)
@@ -194,20 +202,13 @@ class Lfm2AttentionDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        bidirectional: bool = False,
     ) -> None:
         super().__init__()
         self.prefix = prefix
         self.config = config
         self.layer_idx = layer_idx
 
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-            config, "original_max_position_embeddings", None
-        ):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.self_attn = Lfm2Attention(
@@ -216,17 +217,16 @@ class Lfm2AttentionDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            bidirectional=bidirectional,
         )
 
         self.feed_forward = Lfm2MLP(
             dim=config.block_dim,
-            ff_dim=config.block_ff_dim,
+            intermediate_size=config.intermediate_size,
             multiple_of=config.block_multiple_of,
             auto_adjust_ff_dim=config.block_auto_adjust_ff_dim,
             ffn_dim_multiplier=config.block_ffn_dim_multiplier,
@@ -253,6 +253,85 @@ class Lfm2AttentionDecoderLayer(nn.Module):
         return self.feed_forward(hidden_states), residual
 
 
+def _bidirectional_conv1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    positions: torch.Tensor,
+    is_padding: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Same-padding depthwise convolution over packed, complete sequences."""
+    kernel_size = weight.shape[-1]
+    padding = kernel_size // 2
+    # Each encoder request starts at position zero. For packed requests
+    # x = [a0, a1, a2, b0, b1], positions = [0, 1, 2, 0, 1] gives
+    # sequence_ids = [1, 1, 1, 2, 2].
+    sequence_ids = (positions == 0).cumsum(0)
+    if is_padding is not None:
+        # Keep runtime padding (e.g. CUDA graph padding) distinct from real requests.
+        sequence_ids = sequence_ids.masked_fill(is_padding, -2)
+    # With kernel_size=3 and no runtime padding, the example becomes:
+    # padded_ids = [-1, 1, 1, 1, 2, 2, -1]
+    # padded_x   = [ 0, a0, a1, a2, b0, b1, 0]
+    padded_ids = F.pad(sequence_ids, (padding, padding), value=-1)
+    padded_x = F.pad(x, (0, 0, padding, padding))
+    output = torch.zeros_like(x, dtype=torch.float32)
+    for tap in range(kernel_size):
+        # Exclude neighbors across request boundaries (e.g. a2 and b0).
+        same_sequence = padded_ids[tap : tap + x.shape[0]] == sequence_ids
+        values = padded_x[tap : tap + x.shape[0]].float()
+        values = values.masked_fill(~same_sequence[:, None], 0)
+        output = output + values * weight[:, 0, tap].float()
+    if bias is not None:
+        output = output + bias.float()
+    return output.to(x.dtype)
+
+
+class Lfm2BidirectionalShortConv(nn.Module):
+    def __init__(
+        self,
+        config: Lfm2Config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        dim = config.conv_dim
+        self.conv = ColumnParallelLinear(
+            config.conv_L_cache, dim, bias=config.conv_bias, prefix=f"{prefix}.conv1d"
+        )
+        self.conv.weight.data = self.conv.weight.data.unsqueeze(1)
+        self.in_proj = MergedColumnParallelLinear(
+            dim,
+            [dim] * 3,
+            bias=config.conv_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.in_proj",
+        )
+        self.out_proj = RowParallelLinear(
+            dim,
+            dim,
+            bias=config.conv_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.out_proj",
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        projected, _ = self.in_proj(hidden_states)
+        b, c, x = projected.chunk(3, dim=-1)
+        is_padding = get_forward_context().is_padding
+        output = _bidirectional_conv1d(
+            b * x,
+            self.conv.weight,
+            self.conv.bias,
+            positions,
+            is_padding[: hidden_states.shape[0]] if is_padding is not None else None,
+        )
+        output, _ = self.out_proj(c * output)
+        return output
+
+
 class Lfm2ShortConvDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -262,21 +341,29 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        bidirectional: bool = False,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.conv = ShortConv(
-            config=config,
-            dim=config.conv_dim,
-            layer_idx=layer_idx,
-            model_config=model_config,
-            cache_config=cache_config,
-            prefix=f"{prefix}.conv",
-        )
+        self.bidirectional = bidirectional
+        if bidirectional:
+            self.short_conv = Lfm2BidirectionalShortConv(
+                config, quant_config=quant_config, prefix=f"{prefix}.short_conv"
+            )
+        else:
+            self.short_conv = ShortConv(
+                config=config,
+                dim=config.conv_dim,
+                layer_idx=layer_idx,
+                model_config=model_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.short_conv",
+            )
 
         self.feed_forward = Lfm2MLP(
             dim=config.block_dim,
-            ff_dim=config.block_ff_dim,
+            intermediate_size=config.intermediate_size,
             multiple_of=config.block_multiple_of,
             auto_adjust_ff_dim=config.block_auto_adjust_ff_dim,
             ffn_dim_multiplier=config.block_ffn_dim_multiplier,
@@ -290,6 +377,7 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        positions: torch.Tensor | None = None,
         **kwargs,
     ):
         if residual is None:
@@ -297,11 +385,12 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
             hidden_states = self.operator_norm(hidden_states)
         else:
             hidden_states, residual = self.operator_norm(hidden_states, residual)
-        output = torch.empty_like(hidden_states)
-        self.conv(
-            hidden_states,
-            output,
-        )
+        if self.bidirectional:
+            assert positions is not None
+            output = self.short_conv(hidden_states, positions)
+        else:
+            output = torch.empty_like(hidden_states)
+            self.short_conv(hidden_states, output)
         hidden_states, residual = self.ffn_norm(output, residual)
         hidden_states = self.feed_forward(hidden_states)
         return hidden_states, residual
@@ -309,23 +398,33 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Lfm2Model(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    # HF uses .conv. but vLLM uses .short_conv. to avoid LoRA regex collision
+    # with the inner .conv.conv child (ShortConv has a child self.conv, so
+    # naming the container .conv too makes _match_target_modules match both).
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={".conv.": ".short_conv."},
+        orig_to_new_stacked={
+            ".q_proj": (".qkv_proj", "q"),
+            ".k_proj": (".qkv_proj", "k"),
+            ".v_proj": (".qkv_proj", "v"),
+            ".w1": (".w13", 0),
+            ".w3": (".w13", 1),
+        },
+    )
+
+    def __init__(
+        self, *, vllm_config: VllmConfig, prefix: str = "", bidirectional: bool = False
+    ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
 
         self.config = config
-        lora_vocab = (
-            (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1))
-            if lora_config
-            else 0
-        )
-        self.vocab_size = config.vocab_size + lora_vocab
-        self.org_vocab_size = config.vocab_size
+
+        self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size, config.hidden_size, org_num_embeddings=config.vocab_size
@@ -344,6 +443,7 @@ class Lfm2Model(nn.Module):
                 cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
+                bidirectional=bidirectional,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -358,12 +458,12 @@ class Lfm2Model(nn.Module):
         else:
             self.embedding_norm = PPMissingLayer()
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -372,7 +472,7 @@ class Lfm2Model(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
+                hidden_states = self.embed_input_ids(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -393,35 +493,28 @@ class Lfm2Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".w1", ".w1", 0),
-            (".w1", ".w3", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+
+@attn_type("encoder_only")
+@default_pooling_type(seq_pooling_type="CLS")
+class Lfm2BidirectionalModel(Lfm2Model):
+    is_pooling_model = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        if not envs.VLLM_MOE_SKIP_PADDING:
+            logger.warning_once(
+                "Enabling VLLM_MOE_SKIP_PADDING for Lfm2BidirectionalModel "
+                "because bidirectional convolution requires an accurate "
+                "runtime padding mask."
+            )
+        os.environ["VLLM_MOE_SKIP_PADDING"] = "1"
+
+        super().__init__(vllm_config=vllm_config, prefix=prefix, bidirectional=True)
+        pooler_config = vllm_config.model_config.pooler_config
+        assert pooler_config is not None
+        self.pooler = pooler_for_embed(pooler_config)
 
 
 class Lfm2ForCausalLM(
@@ -433,18 +526,21 @@ class Lfm2ForCausalLM(
             "k_proj",
             "v_proj",
         ],
-        "w1": [
+        "w13": [
             "w1",
             "w3",
         ],
+        "in_proj": ["in_proj"],
     }
+
+    # Reuse the backbone mapper so LoRA/quantization see the same name mapping.
+    hf_to_vllm_mapper = Lfm2Model.hf_to_vllm_mapper
 
     # LoRA specific attributes
     embedding_modules = {
         "embed_tokens": "input_embeddings",
         "lm_head": "output_embeddings",
     }
-    embedding_padding_modules = ["lm_head"]
 
     @classmethod
     def get_mamba_state_dtype_from_config(
@@ -469,6 +565,7 @@ class Lfm2ForCausalLM(
         Returns:
             Tuple containing:
             - conv_state_shape: Shape for convolutional state cache
+
         """
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_config
@@ -479,15 +576,13 @@ class Lfm2ForCausalLM(
             conv_kernel=hf_config.conv_L_cache,
         )
 
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.short_conv_state_copy_func()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        cache_config = vllm_config.cache_config
-        lora_config = vllm_config.lora_config
-        assert not cache_config.enable_prefix_caching, (
-            "Lfm2 currently does not support prefix caching"
-        )
-
         super().__init__()
         self.config = config
         self.model = Lfm2Model(
@@ -495,21 +590,9 @@ class Lfm2ForCausalLM(
         )
 
         if get_pp_group().is_last_rank:
-            self.unpadded_vocab_size = self.config.vocab_size
-            if lora_config:
-                self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
-
             self.lm_head = ParallelLMHead(
-                self.unpadded_vocab_size,
+                config.vocab_size,
                 config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                padding_size=(
-                    DEFAULT_VOCAB_PADDING_SIZE
-                    # We need bigger padding if using lora for kernel
-                    # compatibility
-                    if not lora_config
-                    else lora_config.lora_vocab_padding_size
-                ),
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
@@ -517,20 +600,18 @@ class Lfm2ForCausalLM(
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(
-            self.unpadded_vocab_size, config.vocab_size
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -546,8 +627,5 @@ class Lfm2ForCausalLM(
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

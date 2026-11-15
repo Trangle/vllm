@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Utilities for Punica kernel construction.
-"""
+"""Utilities for Punica kernel construction."""
 
 from vllm.triton_utils import tl, triton
 
 
 @triton.jit
 def mm_k(
-    a_ptr,
-    b_ptr,
-    ak_stride,
-    bk_stride,
-    offset_k,
+    a_ptr: tl.tensor,
+    b_ptr: tl.tensor,
+    ak_stride: int,
+    bk_stride: int,
+    offset_k: tl.tensor,
     K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -22,50 +20,90 @@ def mm_k(
     SPLIT_K: tl.constexpr,
     CAST_TYPE: tl.constexpr,
     b_dtype: tl.constexpr,
+    USE_GDC: tl.constexpr,
+    base_k: int,
 ):
-    """
-    Given a_ptr and b_ptr, that identify the rows of A (m x k) and columns of
+    """Given a_ptr and b_ptr, that identify the rows of A (m x k) and columns of
     B (k x n), iterate, through the K dimension to compute the partial/complete
     matrix block product.
     If SPLIT_K == 1, the output m x n product is complete.
     If SPLIT_K > 1, the thread block computes partial outputs. The partial
     outputs are then atomically summed in the caller code.
+
     Args:
         a_ptr: Array of pointers, identifying rows of A
         b_ptr: Array of pointers, identifying columns of B
         ak_stride: K dimension stride of the A matrix
         bk_stride: K dimension stride of the B matrix
+        offset_k: Offsets within the current BLOCK_K tile along K
         K: Length of the K dimension
         BLOCK_M: M dimension of the output block m x n
         BLOCK_N: N dimension of the output block m x n
         BLOCK_K: K dimension atom
         EVEN_K: True if the blocks of A and B can be loaded without any
-          masking.
+            masking.
         SPLIT_K: Parameter signifying parallelism in the K dimension.
         CAST_TYPE: if True, cast the values from the A matrix to the B
-          matrix dtype.
+            matrix dtype.
         b_dtype: datatype of the B matrix
+        USE_GDC: Whether to use PDL. True indicates use.
+        base_k: Base offset along K dimension for current SPLIT_K group
+
     """
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(tl.cdiv(K, BLOCK_K * SPLIT_K)):
+
+    # Step size along K for each iteration
+    STEP_K = BLOCK_K * SPLIT_K
+
+    # Total number of iterations (compile-time constant)
+    num_iters = tl.cdiv(K, STEP_K)
+
+    for k in range(num_iters):
+        # Current iteration's global K offset
+        iter_k = k * STEP_K + base_k
+
+        # Check if this iteration is completely valid (no masking needed)
+        block_end = iter_k + BLOCK_K
+
         if EVEN_K:
-            tiled_a = tl.load(a_ptr)
+            # K is divisible by BLOCK_K, no masking ever needed
+            # pre-fetch lora weight
             tiled_b = tl.load(b_ptr)
+            if USE_GDC:
+                tl.extra.cuda.gdc_wait()
+            tiled_a = tl.load(a_ptr)
+            if CAST_TYPE:
+                tiled_a = tiled_a.to(b_dtype)
+            accumulator += tl.dot(tiled_a, tiled_b)
         else:
-            tiled_a = tl.load(
-                a_ptr, mask=offset_k[None, :] < K - k * (BLOCK_K * SPLIT_K), other=0
-            )
-            tiled_b = tl.load(
-                b_ptr, mask=offset_k[:, None] < K - k * (BLOCK_K * SPLIT_K), other=0
-            )
-        if CAST_TYPE:
-            tiled_a = tiled_a.to(b_dtype)
-        accumulator += tl.dot(
-            tiled_a,
-            tiled_b,
-        )
-        a_ptr += BLOCK_K * SPLIT_K * ak_stride
-        b_ptr += BLOCK_K * SPLIT_K * bk_stride
+            # Check if we need element-wise masking
+            if iter_k >= K:
+                # Entire block out of range, skip
+                pass
+            elif block_end <= K:
+                # Entire block in range, no masking needed (fast path)
+                tiled_b = tl.load(b_ptr)
+                if USE_GDC:
+                    tl.extra.cuda.gdc_wait()
+                tiled_a = tl.load(a_ptr)
+                if CAST_TYPE:
+                    tiled_a = tiled_a.to(b_dtype)
+                accumulator += tl.dot(tiled_a, tiled_b)
+            else:
+                # Partial block, need masking (only last iteration)
+                k_offsets = tl.arange(0, BLOCK_K)
+                mask = iter_k + k_offsets < K
+                tiled_b = tl.load(b_ptr, mask=mask[:, None], other=0.0)
+                if USE_GDC:
+                    tl.extra.cuda.gdc_wait()
+                tiled_a = tl.load(a_ptr, mask=mask[None, :], other=0.0)
+                if CAST_TYPE:
+                    tiled_a = tiled_a.to(b_dtype)
+                accumulator += tl.dot(tiled_a, tiled_b)
+
+        a_ptr += STEP_K * ak_stride
+        b_ptr += STEP_K * bk_stride
+
     return accumulator
 
 
@@ -102,16 +140,15 @@ def do_expand_kernel(
     EVEN_K: tl.constexpr,
     CAST_TYPE: tl.constexpr,
     ADD_INPUTS: tl.constexpr,
+    USE_GDC: tl.constexpr,
 ):
-    """
-    Given an array of integers that identifies the rows of A, ram,
+    """Given an array of integers that identifies the rows of A, ram,
     a lora index that identifies which LoRA to use from lora_ptr, lora_index,
     a slice_id that identifies the input/output slice,
     compute the matrix product and store in the appropriate output location.
     Given that this is an expand kernel, we don't perform any split-K reduction
     as the K dimension is assumed to be small.
     """
-
     # ls_d*_ptr can be either an integer or a pointer
     if SAME_STRIDE:
         # integer
@@ -154,6 +191,7 @@ def do_expand_kernel(
 
     # Compute the block matrix product.
     SPLIT_K = 1
+
     accumulator = mm_k(
         a_ptr,
         b_ptr,
@@ -168,6 +206,8 @@ def do_expand_kernel(
         SPLIT_K,
         CAST_TYPE,
         cur_lora_ptr.dtype.element_ty,
+        USE_GDC,
+        base_k=0,
     )
 
     tiled_c = accumulator.to(cur_lora_ptr.dtype.element_ty)
@@ -181,7 +221,8 @@ def do_expand_kernel(
     offset_cm = tl.arange(0, BLOCK_M)
     c_ptr = (
         out_ptr
-        + ram[:, None] * output_d0_stride
+        # int64 to keep the row offset from overflowing at long context lengths
+        + ram[:, None].to(tl.int64) * output_d0_stride
         + offset_cn[None, :] * output_d1_stride
     )
     c_mask = (offset_cm[:, None] < M_LEN) & (offset_cn[None, :] < (cur_slice_start + N))
@@ -216,6 +257,7 @@ def do_shrink_kernel(
     output_d0_stride,
     output_d1_stride,
     output_d2_stride,
+    output_split_stride,
     scaling,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -223,14 +265,14 @@ def do_shrink_kernel(
     EVEN_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
     SLICE_NUM: tl.constexpr,
+    USE_GDC: tl.constexpr,
+    STORE_PARTIALS: tl.constexpr,
 ):
-    """
-    Given an array of integers that identifies the rows of A, ram,
+    """Given an array of integers that identifies the rows of A, ram,
     a lora index that identifies which LoRA to use from lora_ptr, lora_index,
     a slice_id that identifies the input/output slice, compute the
     matrix product and store in the appropriate output location.
     """
-
     # Identify the lora_ptr from slice_id.
     if SLICE_NUM == 1:
         # current lora ptr
@@ -248,7 +290,10 @@ def do_shrink_kernel(
     # Identify A and B block pointers
     offset_k = pid_sk * BLOCK_K + tl.arange(0, BLOCK_K)
     a_ptr = (
-        input_ptr + ram[:, None] * input_d0_stride + offset_k[None, :] * input_d1_stride
+        input_ptr
+        # int64 to keep the row offset from overflowing at long context lengths
+        + ram[:, None].to(tl.int64) * input_d0_stride
+        + offset_k[None, :] * input_d1_stride
     )
     b_ptr = (
         cur_lora_ptr
@@ -272,12 +317,25 @@ def do_shrink_kernel(
         SPLIT_K,
         False,
         cur_lora_ptr.dtype.element_ty,
+        False,  # USE_GDC is always False in shrink kernel
+        base_k=pid_sk * BLOCK_K,
     )
-
+    # GDC launch dependents hints the runtime system to launch dependent kernels.
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
     # Identify the C output pointers to store the results of the accumulator.
     offset_cn = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     offset_cm = tl.arange(0, BLOCK_M)
-    cur_out_ptr = out_ptr if SLICE_NUM == 1 else out_ptr + slice_id * output_d0_stride
+    if STORE_PARTIALS:
+        cur_out_ptr = (
+            out_ptr
+            + slice_id.to(tl.int64) * output_d0_stride
+            + pid_sk.to(tl.int64) * output_split_stride
+        )
+    else:
+        cur_out_ptr = (
+            out_ptr if SLICE_NUM == 1 else out_ptr + slice_id * output_d0_stride
+        )
     c_ptr = (
         cur_out_ptr
         + ram[:, None] * output_d1_stride
@@ -285,9 +343,14 @@ def do_shrink_kernel(
     )
     c_mask = (offset_cm[:, None] < M_LEN) & (offset_cn[None, :] < N)
 
-    accumulator *= scaling
-    # handles write-back with reduction-splitting
-    if SPLIT_K == 1:
+    if STORE_PARTIALS:
+        # Unscaled FP32 partial per K split; the reducer adds the splits in a
+        # fixed order and applies scaling once.
         tl.store(c_ptr, accumulator, mask=c_mask)
     else:
-        tl.atomic_add(c_ptr, accumulator, mask=c_mask)
+        accumulator *= scaling
+        # handles write-back with reduction-splitting
+        if SPLIT_K == 1:
+            tl.store(c_ptr, accumulator, mask=c_mask)
+        else:
+            tl.atomic_add(c_ptr, accumulator, mask=c_mask, sem="relaxed")

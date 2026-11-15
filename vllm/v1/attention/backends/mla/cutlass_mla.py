@@ -7,32 +7,48 @@ from typing import ClassVar
 import torch
 
 import vllm._custom_ops as ops
-from vllm.attention.backends.abstract import (
-    AttentionLayer,
-    AttentionType,
-    MultipleOf,
-    is_quantized_kv_cache,
-)
+from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.mla.common import (
+from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
     MLACommonImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
 )
-from vllm.v1.attention.backends.utils import AttentionCGSupport
+from vllm.platforms.interface import DeviceCapability
+from vllm.utils.platform_utils import num_compute_units
+from vllm.v1.attention.backend import (
+    AttentionCGSupport,
+    AttentionLayer,
+    AttentionType,
+    MultipleOf,
+)
+from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
 logger = init_logger(__name__)
 
 
 class CutlassMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     # enable full CUDA Graph support for decode-only capture
-    cudagraph_support: ClassVar[AttentionCGSupport] = (
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
 
 
 class CutlassMLABackend(MLACommonBackend):
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        return [128]
+
     @staticmethod
     def get_name() -> str:
         return "CUTLASS_MLA"
@@ -45,9 +61,9 @@ class CutlassMLABackend(MLACommonBackend):
     def get_builder_cls() -> type["CutlassMLAMetadataBuilder"]:
         return CutlassMLAMetadataBuilder
 
-    @staticmethod
-    def get_supported_kernel_block_size() -> list[int | MultipleOf]:
-        return [128]
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        return capability.major == 10
 
 
 class SM100Workspace:
@@ -60,8 +76,7 @@ class SM100Workspace:
 
         # Pre-compute sm_count to avoid recomputing it. Use device 0 as a proxy
         # (assumes all devices are similar)
-        properties = torch.cuda.get_device_properties(torch.device("cuda:0"))
-        self._sm_count = properties.multi_processor_count
+        self._sm_count = num_compute_units(0)
 
     def get_buf(self):
         return self._workspace_buf
@@ -88,6 +103,7 @@ MAX_HEADS = 128
 
 class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
     can_return_lse_for_decode: bool = True
+    supports_dcp: bool = True
 
     def __init__(
         self,
@@ -161,9 +177,8 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
         assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
         assert kv_c_and_k_pe_cache.ndim == 3, (
-            "kv_c_and_k_pe_cache must be a 3D tensor, but got {}".format(
-                kv_c_and_k_pe_cache.ndim
-            )
+            "kv_c_and_k_pe_cache must be a 3D tensor, "
+            f"but got {kv_c_and_k_pe_cache.ndim}"
         )
 
         B_q, H, D_q_nope = q_nope.shape
@@ -230,7 +245,7 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         return out, lse
 
-    def _forward_decode(
+    def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
@@ -239,6 +254,11 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
+
+        if layer._q_scale_float != 1.0 or layer._k_scale_float != 1.0:
+            raise NotImplementedError(
+                "CutlassMLAImpl does not support scaling for q and kv_latent yet"
+            )
 
         if type(q) is tuple:
             q_nope, q_pe = q

@@ -14,41 +14,76 @@
  * limitations under the License.
  */
 
-#include <torch/all.h>
+#include <torch/csrc/stable/tensor.h>
+
+#include "torch_utils.h"
+
+#include "cutlass_extensions/common.hpp"
 
 #if defined ENABLE_NVFP4_SM100 && ENABLE_NVFP4_SM100
-void cutlass_scaled_fp4_mm_sm100a(torch::Tensor& D, torch::Tensor const& A,
-                                  torch::Tensor const& B,
-                                  torch::Tensor const& A_sf,
-                                  torch::Tensor const& B_sf,
-                                  torch::Tensor const& alpha);
+void cutlass_scaled_fp4_mm_sm100a(torch::stable::Tensor& D,
+                                  torch::stable::Tensor const& A,
+                                  torch::stable::Tensor const& B,
+                                  torch::stable::Tensor const& A_sf,
+                                  torch::stable::Tensor const& B_sf,
+                                  torch::stable::Tensor const& alpha);
 #endif
 
 #if defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120
-void cutlass_scaled_fp4_mm_sm120a(torch::Tensor& D, torch::Tensor const& A,
-                                  torch::Tensor const& B,
-                                  torch::Tensor const& A_sf,
-                                  torch::Tensor const& B_sf,
-                                  torch::Tensor const& alpha);
+void cutlass_scaled_fp4_mm_sm120a(
+    torch::stable::Tensor& D, torch::stable::Tensor const& A,
+    torch::stable::Tensor const& B, torch::stable::Tensor const& A_sf,
+    torch::stable::Tensor const& B_sf, torch::stable::Tensor const& alpha,
+    std::optional<torch::stable::Tensor> const& bias);
 #endif
 
-void cutlass_scaled_fp4_mm(torch::Tensor& D, torch::Tensor const& A,
-                           torch::Tensor const& B, torch::Tensor const& A_sf,
-                           torch::Tensor const& B_sf,
-                           torch::Tensor const& alpha) {
-#if defined ENABLE_NVFP4_SM100 && ENABLE_NVFP4_SM100
-  return cutlass_scaled_fp4_mm_sm100a(D, A, B, A_sf, B_sf, alpha);
-#elif defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120
-  return cutlass_scaled_fp4_mm_sm120a(D, A, B, A_sf, B_sf, alpha);
+void cutlass_scaled_fp4_mm(torch::stable::Tensor& D,
+                           const torch::stable::Tensor& A,
+                           const torch::stable::Tensor& B,
+                           const torch::stable::Tensor& A_sf,
+                           const torch::stable::Tensor& B_sf,
+                           const torch::stable::Tensor& alpha,
+                           const std::optional<torch::stable::Tensor>& bias) {
+  // Make sure we're on A's device.
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      A.get_device_index());
+  const int32_t sm = get_sm_version_num();
+
+#if defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100
+  if (sm >= 100 && sm < 120) {
+    STD_TORCH_CHECK(!bias.has_value(),
+                    "The nvfp4 mm bias epilogue is not supported on SM ", sm);
+    cutlass_scaled_fp4_mm_sm100a(D, A, B, A_sf, B_sf, alpha);
+    return;
+  }
 #endif
-  TORCH_CHECK_NOT_IMPLEMENTED(false,
-                              "No compiled nvfp4 mm kernel, vLLM should "
-                              "be compiled using CUDA 12.8 and target "
-                              "compute capability 100 or above.");
+
+#if defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120
+  if (sm >= 120 && sm < 130) {
+    cutlass_scaled_fp4_mm_sm120a(D, A, B, A_sf, B_sf, alpha, bias);
+    return;
+  }
+#endif
+
+  STD_TORCH_CHECK_NOT_IMPLEMENTED(
+      false, "No compiled nvfp4 mm kernel for SM ", sm,
+      ". Recompile with CUDA >= 12.8 and CC >= 100.");
 }
 
 bool cutlass_scaled_mm_supports_fp4(int64_t cuda_device_capability) {
   int runtimeVersion;
   cudaRuntimeGetVersion(&runtimeVersion);
-  return cuda_device_capability >= 100 && runtimeVersion >= 12080;
+  if (runtimeVersion < 12080) return false;
+  // Only report support when the SM-specific kernel was actually compiled in,
+  // so the Python-side backend selector does not choose CUTLASS and then hit
+  // TORCH_CHECK_NOT_IMPLEMENTED (or worse, fall through to Marlin).
+#if defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100
+  if (cuda_device_capability >= 100 && cuda_device_capability < 120)
+    return true;
+#endif
+#if defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120
+  if (cuda_device_capability >= 120 && cuda_device_capability < 130)
+    return true;
+#endif
+  return false;
 }

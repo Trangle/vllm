@@ -1,355 +1,142 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, ClassVar
 
-import numpy as np
+if TYPE_CHECKING:
+    from vllm.config.cache import CacheDType
+
 import torch
-from torch.nn.functional import scaled_dot_product_attention
 
-from vllm.attention.backends.abstract import (
+from vllm import _cpu_ops as ops
+from vllm import envs
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config,
+    get_layers_from_vllm_config,
+)
+from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import Attention
+from vllm.platforms import CpuArchEnum, current_platform
+from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionLayer,
-    AttentionMetadata,
+    AttentionMetadataBuilder,
     AttentionType,
+    CommonAttentionMetadata,
+    MultipleOf,
+)
+from vllm.v1.attention.backends.utils import (
+    get_attn_type_from_layers,
+    get_num_attention_heads_from_layers,
+)
+from vllm.v1.attention.backends.zentorch_sdpa import (
+    should_use_zentorch_sdpa,
+    zentorch_sdpa_attn,
+)
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheLayout,
     is_quantized_kv_cache,
 )
-from vllm.config import VllmConfig
-from vllm.logger import init_logger
-from vllm.v1.attention.backends.utils import (
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-    split_decodes_and_prefills,
-)
-from vllm.v1.kv_cache_interface import AttentionSpec
-
-try:
-    import intel_extension_for_pytorch.llm.modules as ipex_modules
-
-    _use_ipex = True
-# AttributeError is to handle a bug in ipex
-# https://github.com/intel/intel-extension-for-pytorch/pull/813
-except (ImportError, AttributeError):
-    _use_ipex = False
-
-from vllm import _custom_ops as ops
 
 logger = init_logger(__name__)
 
 
-class TorchSDPABackend(AttentionBackend):
-    accept_output_buffer: bool = False
+class CPUAttentionBackend(AttentionBackend):
+    forward_includes_kv_cache_update: bool = False
+
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ]
+    supported_kv_cache_dtypes: ClassVar[list["CacheDType"]] = [
+        "auto",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        return [MultipleOf(32)]
 
     @classmethod
-    def get_supported_dtypes(cls) -> list[torch.dtype]:
-        return [torch.float16, torch.bfloat16, torch.float32]
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: "CacheDType | None") -> bool:
+        if kv_cache_dtype in (None, "auto", "bfloat16", "float16"):
+            return True
+        if kv_cache_dtype not in cls.supported_kv_cache_dtypes:
+            return False
+        # Mirrors the FP8 ISA requirement enforced in _get_attn_isa.
+        return torch.cpu._is_amx_tile_supported() or torch.cpu._is_avx512_supported()
 
     @classmethod
-    def validate_head_size(cls, head_size: int) -> None:
-        attn_impl = _get_paged_attn_impl()
-        is_valid, supported_head_sizes = attn_impl.validate_head_size(head_size)
-        if not is_valid:
-            attn_type = cls.__name__.removesuffix("Backend")
-            raise ValueError(
-                f"Head size {head_size} is not supported by {attn_type}. "
-                f"Supported head sizes are: {supported_head_sizes}. "
-                "Set VLLM_ATTENTION_BACKEND=FLEX_ATTENTION to use "
-                "FlexAttention backend which supports all head sizes."
-            )
+    def get_supported_head_sizes(cls) -> list[int]:
+        return [32, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # The CPU backend only reads head-major block interiors.
+        return (KVCacheLayout.LBHNC,)
 
     @staticmethod
     def get_name() -> str:
-        return "TORCH_SDPA"
+        return "CPU_ATTN"
 
-    @staticmethod
-    def get_impl_cls() -> type["TorchSDPABackendImpl"]:
-        return TorchSDPABackendImpl
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
 
-    @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        return TorchSDPAMetadata
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return True
 
-    @staticmethod
-    def get_builder_cls() -> type["TorchSDPAMetadataBuilderV1"]:
-        return TorchSDPAMetadataBuilderV1
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return _get_paged_attn_impl().get_kv_cache_shape(
-            num_blocks, block_size, num_kv_heads, head_size
+    @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        """CPU attention supports decoder,
+        encoder-only and encoder-decoder attention."""
+        return attn_type in (
+            AttentionType.DECODER,
+            AttentionType.ENCODER,
+            AttentionType.ENCODER_ONLY,
+            AttentionType.ENCODER_DECODER,
         )
 
     @staticmethod
-    def use_cascade_attention(*args, **kwargs) -> bool:
-        return False
+    def get_impl_cls() -> type["CPUAttentionBackendImpl"]:
+        return CPUAttentionBackendImpl
+
+    @staticmethod
+    def get_builder_cls() -> type["CPUAttentionMetadataBuilder"]:
+        return CPUAttentionMetadataBuilder
 
 
 @dataclass
-class TorchSDPAMetadata(AttentionMetadata):
-    """Attention metadata for prefill and decode batched together."""
-
-    # Total number of prefill requests.
-    num_prefills: int
-    # Number of prefill tokens.
-    num_prefill_tokens: int
-    # Number of decode tokens. Note that it is equivalent to the number of
-    # decode requests.
-    num_decode_tokens: int
-    # (num_tokens,). The indices of the token slots that input tokens will be
-    # stored into. E.g., if `slot_mapping` is [35, 2, 17] and the block size
-    # is 16, the three tokens are stored in the 3rd slot in block 2, 2nd slot
-    # in block 0, and 1st slot in block 1, respectively.
+class CPUAttentionMetadata:
+    num_actual_tokens: int  # Number of tokens excluding padding.
+    max_query_len: int
+    query_start_loc: torch.Tensor
+    max_seq_len: int
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
     slot_mapping: torch.Tensor
-    """Metadata for PagedAttention."""
-    # (batch_size,). The length of sequences (entire tokens seen so far) per
-    # sequence.
-    decode_seq_lens_tensor: torch.Tensor | None
-    # Maximum sequence length in the batch. 0 if it is prefill-only batch.
-    decode_max_seq_len: int
-    # (batch_size, max_blocks_per_seq).
-    # Block addresses per sequence. (Seq id -> list of physical block)
-    # E.g., [0, 1, 2] means tokens are stored in 0th, 1st, and 2nd blocks
-    # in the kv cache. Each block can contain up to block_size tokens.
-    # 2nd dimensions are padded up to max_blocks_per_seq if it is cuda-graph
-    # captured.
-    decode_block_tables: torch.Tensor | None
-    """Metadata for TorchSDPABackend.
-    """
-    # Currently, input sequences can only contain all prompts
-    # or all decoding. True if all sequences are prompts.
-    chunked_prefill: bool
-    seq_lens: list[int] | None = None  # For non-chunked prefill
+    scheduler_metadata: torch.Tensor | None
+    causal: bool = True
+    dynamic_causal: torch.Tensor | None = None
 
-    # For chunked prefill only
-    max_query_len: int | None = None
-    prefill_max_seq_len: int | None = None
-    prefill_query_start_loc: torch.Tensor | None = None
-    prefill_seq_start_loc: torch.Tensor | None = None
-    prefill_block_tables: torch.Tensor | None = None
+    # can be removed after deprecate sdpa
+    use_sdpa_prefill: bool = False
+    num_decode_tokens: int = 0
+    sdpa_attn_masks: list[torch.Tensor | None] | None = None
+    sdpa_start_loc: torch.Tensor | None = None
 
-    # For V1 logits index only
-    query_start_loc: torch.Tensor | None = None
-
-    # Begin encoder attn & enc/dec cross-attn fields...
-    # Encoder sequence lengths representation
-    encoder_seq_lens: list[int] | None = None
-    encoder_seq_lens_tensor: torch.Tensor | None = None
-
-    # Maximum sequence length among encoder sequences
-    max_encoder_seq_len: int | None = None
-
-    # Number of tokens input to encoder
-    num_encoder_tokens: int | None = None
-
-    # Cross-attention memory-mapping data structures: slot mapping
-    # and block tables
-    cross_slot_mapping: torch.Tensor | None = None
-    cross_block_tables: torch.Tensor | None = None
-
-    def __post_init__(self):
-        # Set during the execution of the first attention op.
-        # It is a list because it is needed to set per prompt
-        # when alibi slopes is used. It is because of the limitation
-        # from xformer API.
-        # will not appear in the __repr__ and __init__
-        self.attn_bias: list[torch.Tensor] | None = None
-        self.encoder_attn_bias: list[torch.Tensor] | None = None
-        self.cross_attn_bias: list[torch.Tensor] | None = None
-
-    @property
-    def is_all_encoder_attn_metadata_set(self):
-        """
-        All attention metadata required for encoder attention is set.
-        """
-        return (
-            (self.encoder_seq_lens is not None)
-            and (self.encoder_seq_lens_tensor is not None)
-            and (self.max_encoder_seq_len is not None)
-        )
-
-    @property
-    def is_all_cross_attn_metadata_set(self):
-        """
-        All attention metadata required for enc/dec cross-attention is set.
-
-        Superset of encoder attention required metadata.
-        """
-        return (
-            self.is_all_encoder_attn_metadata_set
-            and (self.cross_slot_mapping is not None)
-            and (self.cross_block_tables is not None)
-        )
-
-    @property
-    def prefill_metadata(self) -> Optional["TorchSDPAMetadata"]:
-        if self.num_prefill_tokens == 0:
-            return None
-        return self
-
-    @property
-    def decode_metadata(self) -> Optional["TorchSDPAMetadata"]:
-        if self.num_decode_tokens == 0:
-            return None
-        return self
-
-    def get_seq_lens(
-        self,
-        attn_type: str,
-    ):
-        """
-        Extract appropriate sequence lengths from attention metadata
-        according to attention type.
-
-        Arguments:
-
-        * attn_metadata: Attention metadata structure associated with attention
-        * attn_type: encoder attention, decoder self-attention,
-                    encoder/decoder cross-attention
-
-        Returns:
-        * Appropriate sequence lengths tensor for query
-        * Appropriate sequence lengths tensor for key & value
-        """
-
-        if (
-            attn_type == AttentionType.DECODER
-            or attn_type == AttentionType.ENCODER_ONLY
-        ):
-            seq_lens_q = self.seq_lens
-            seq_lens_kv = self.seq_lens
-        elif attn_type == AttentionType.ENCODER:
-            seq_lens_q = self.encoder_seq_lens
-            seq_lens_kv = self.encoder_seq_lens
-        elif attn_type == AttentionType.ENCODER_DECODER:
-            seq_lens_q = self.seq_lens
-            seq_lens_kv = self.encoder_seq_lens
-        else:
-            raise AttributeError(f"Invalid attention type {str(attn_type)}")
-        return seq_lens_q, seq_lens_kv
-
-    def get_attn_bias(
-        self,
-        attn_type: str,
-    ) -> list[torch.Tensor] | None:
-        """
-        Extract appropriate attention bias from attention metadata
-        according to attention type.
-
-        Arguments:
-
-        * attn_metadata: Attention metadata structure associated with attention
-        * attn_type: encoder attention, decoder self-attention,
-                    encoder/decoder cross-attention
-
-        Returns:
-        * Appropriate attention bias value given the attention type
-        """
-
-        if (
-            attn_type == AttentionType.DECODER
-            or attn_type == AttentionType.ENCODER_ONLY
-        ):
-            return self.attn_bias
-        elif attn_type == AttentionType.ENCODER:
-            return self.encoder_attn_bias
-        elif attn_type == AttentionType.ENCODER_DECODER:
-            return self.cross_attn_bias
-        else:
-            raise AttributeError(f"Invalid attention type {str(attn_type)}")
-
-    def set_attn_bias(
-        self,
-        attn_bias: list[torch.Tensor],
-        attn_type: str,
-    ) -> None:
-        """
-        Update appropriate attention bias field of attention metadata,
-        according to attention type.
-
-        Arguments:
-
-        * attn_metadata: Attention metadata structure associated with attention
-        * attn_bias: The desired attention bias value
-        * attn_type: encoder attention, decoder self-attention,
-                    encoder/decoder cross-attention
-        """
-
-        if (
-            attn_type == AttentionType.DECODER
-            or attn_type == AttentionType.ENCODER_ONLY
-        ):
-            self.attn_bias = attn_bias
-        elif attn_type == AttentionType.ENCODER:
-            self.encoder_attn_bias = attn_bias
-        elif attn_type == AttentionType.ENCODER_DECODER:
-            self.cross_attn_bias = attn_bias
-        else:
-            raise AttributeError(f"Invalid attention type {str(attn_type)}")
-
-    def get_seq_len_block_table_args(
-        self,
-        attn_type: str,
-    ) -> tuple:
-        """
-        The particular choice of sequence-length- and block-table-related
-        attributes which should be extracted from attn_metadata is dependent
-        on the type of attention operation.
-
-        Decoder attn -> select entirely decoder self-attention-related fields
-        Encoder/decoder cross-attn -> select encoder sequence lengths &
-                                    cross-attn block-tables fields
-        Encoder attn -> select encoder sequence lengths fields & no block tables
-
-        Arguments:
-
-        * attn_metadata: Attention metadata structure associated with attention
-        * is_prompt: True if prefill, False otherwise
-        * attn_type: encoder attention, decoder self-attention,
-                    encoder/decoder cross-attention
-
-        Returns:
-
-        * Appropriate sequence-lengths tensor
-        * Appropriate max sequence-length scalar
-        * Appropriate block tables (or None)
-        """
-
-        if (
-            attn_type == AttentionType.DECODER
-            or attn_type == AttentionType.ENCODER_ONLY
-        ):
-            # Decoder self-attention
-            # Choose max_seq_len based on whether we are in prompt_run
-            return (
-                self.decode_seq_lens_tensor,
-                self.decode_max_seq_len,
-                self.decode_block_tables,
-            )
-        elif attn_type == AttentionType.ENCODER_DECODER:
-            # Enc/dec cross-attention KVs match encoder sequence length;
-            # cross-attention utilizes special "cross" block tables
-            return (
-                self.encoder_seq_lens_tensor,
-                self.max_encoder_seq_len,
-                self.cross_block_tables,
-            )
-        elif attn_type == AttentionType.ENCODER:
-            # No block tables associated with encoder attention
-            return (self.encoder_seq_lens_tensor, self.max_encoder_seq_len, None)
-        else:
-            raise AttributeError(f"Invalid attention type {str(attn_type)}")
+    encoder_cache: torch.Tensor | None = None
 
 
-class TorchSDPAMetadataBuilderV1(AttentionMetadataBuilder[TorchSDPAMetadata]):
-    reorder_batch_threshold: int = 1
-
+class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]):
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -359,80 +146,153 @@ class TorchSDPAMetadataBuilderV1(AttentionMetadataBuilder[TorchSDPAMetadata]):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
-        self.scheduler_config = vllm_config.scheduler_config
-        self._init_reorder_batch_threshold(1, False)
+        self.kv_cache_spec = kv_cache_spec
+        self.vllm_config = vllm_config
 
-        self.seq_start_loc_cpu = torch.zeros(
-            vllm_config.scheduler_config.max_num_seqs + 1,
-            dtype=torch.int32,
-            device="cpu",
+        parallel_config = vllm_config.parallel_config
+        self.num_kv_heads = kv_cache_spec.num_kv_heads
+        # The scheduler metadata built here sizes a scratchpad from the query
+        # head count, so it must come from this group's layers: the model-wide
+        # count is wrong for models that vary it per layer (e.g. Laguna).
+        self.num_heads = get_num_attention_heads_from_layers(
+            vllm_config, layer_names
+        ) or vllm_config.model_config.get_num_attention_heads(parallel_config)
+        self.head_dim = kv_cache_spec.head_size
+        self.dtype = vllm_config.model_config.dtype
+        self.window_size = self._group_sliding_window()
+        self.block_size = kv_cache_spec.block_size
+        self.kv_cache_dtype = vllm_config.cache_config.cache_dtype
+        self.isa = _get_attn_isa(
+            self.dtype,
+            self.block_size,
+            self.head_dim,
+            self.kv_cache_dtype,
         )
-        self.seq_start_loc_np = self.seq_start_loc_cpu.numpy()
+        self._set_isa_to_layers(layer_names)
+        attn_type = get_attn_type_from_layers(vllm_config, layer_names)
+        self.is_cross_attention = attn_type == AttentionType.ENCODER_DECODER
+        self.is_encoder_only_attention = attn_type == AttentionType.ENCODER_ONLY
+
+    def _set_isa_to_layers(self, layer_names: list[str]) -> None:
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            Attention,
+            layer_names,
+        )
+        for layer in attn_layers.values():
+            layer.isa = self.isa  # type: ignore
+
+    def _group_sliding_window(self) -> int:
+        """The window shared by every layer in this group, else -1 (no window).
+
+        Taken from the layers rather than the group spec: one KV cache group can
+        hold both windowed and global layers (e.g. Gemma-3 with the hybrid KV
+        cache manager disabled), and the scheduler metadata built here is shared
+        by the whole group, so it may only assume a window all of them agree on.
+        """
+        layers = get_layers_from_vllm_config(
+            self.vllm_config, Attention, self.layer_names
+        )
+        windows = {
+            layer.impl.sliding_window
+            for layer in layers.values()
+            if isinstance(layer.impl, CPUAttentionBackendImpl)
+        }
+        if len(windows) != 1:
+            return -1
+        window = windows.pop()
+        return -1 if window is None else window
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> TorchSDPAMetadata:
+    ) -> CPUAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
-
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-        seq_lens_np = seq_lens_cpu.numpy()
-
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        query_start_loc_np = query_start_loc_cpu.numpy()
-
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.reorder_batch_threshold,
-                require_uniform=True,
-            )
-        )
-
-        max_prefill_seq_len = (
-            seq_lens_np[num_decodes:num_reqs].max().item() if num_prefills > 0 else 0
-        )
-        max_decode_seq_len = (
-            seq_lens_np[:num_decodes].max().item() if num_prefills < num_reqs else 0
-        )
-        self.seq_start_loc_np[0] = 0
-        np.cumsum(seq_lens_np, out=self.seq_start_loc_np[1 : num_reqs + 1])
-
-        slot_mapping = common_attn_metadata.slot_mapping.long()
+        max_seq_len = common_attn_metadata.max_seq_len
+        query_start_loc = common_attn_metadata.query_start_loc
+        seq_lens = common_attn_metadata.seq_lens
         block_table_tensor = common_attn_metadata.block_table_tensor
-        query_start_loc_np = query_start_loc_cpu.numpy()
-        query_start_loc_np[num_decodes : num_reqs + 1] -= num_decode_tokens
+        slot_mapping = common_attn_metadata.slot_mapping
+        is_dynamic_casual = isinstance(common_attn_metadata.causal, torch.Tensor)
+        dynamic_casual = None
+        if is_dynamic_casual:
+            dynamic_casual = common_attn_metadata.causal
 
-        attn_metadata = TorchSDPAMetadata(
-            num_prefills=num_prefills,
-            num_prefill_tokens=num_prefill_tokens,
-            num_decode_tokens=num_decode_tokens,
-            slot_mapping=slot_mapping,
-            # to ensure inference when chunked_prefill is disabled
-            seq_lens=seq_lens_cpu.tolist(),
-            decode_seq_lens_tensor=seq_lens_cpu[:num_decodes],  # decode
-            decode_max_seq_len=max_decode_seq_len,  # decode
-            decode_block_tables=block_table_tensor[:num_decodes],  # decode
-            chunked_prefill=self.scheduler_config.chunked_prefill_enabled,
+        causal = (
+            False
+            if self.is_cross_attention
+            or self.is_encoder_only_attention
+            or is_dynamic_casual
+            else common_attn_metadata.causal
+        )
+
+        encoder_cache_tensor = None
+        if self.is_encoder_only_attention:
+            block_nums = (seq_lens + self.block_size - 1) // self.block_size
+            start_block_ids = torch.zeros_like(seq_lens)
+            torch.cumsum(block_nums[:-1], 0, out=start_block_ids[1:])
+            total_block_num: int = block_nums.sum().item()
+            max_block_num = block_nums.max().item()
+            block_offsets = torch.arange(
+                0, max_block_num, dtype=block_table_tensor.dtype
+            )
+            encoder_block_table = start_block_ids[:, None] + block_offsets[None, :]
+            torch.ops._C.compute_slot_mapping_kernel_impl(
+                query_start_loc,
+                common_attn_metadata.positions,
+                encoder_block_table,
+                slot_mapping,
+                self.block_size,
+            )
+            encoder_cache_tensor = torch.zeros(
+                (
+                    total_block_num,
+                    self.num_kv_heads,
+                    self.block_size,
+                    2 * self.head_dim,
+                ),
+                dtype=self.dtype,
+            )
+            block_table_tensor = encoder_block_table
+
+        scheduler_metadata = ops.cpu_attn_get_scheduler_metadata(
+            num_reqs=num_reqs,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            seq_lens=seq_lens,
+            dtype=self.dtype,
+            query_start_loc=query_start_loc,
+            causal=causal,
+            sliding_window_size=self.window_size,
+            isa=self.isa,
+            enable_kv_split=envs.VLLM_CPU_ATTN_SPLIT_KV,
+            dynamic_causal=dynamic_casual,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
+
+        attn_metadata = CPUAttentionMetadata(
+            num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
-            prefill_max_seq_len=max_prefill_seq_len,
-            prefill_query_start_loc=query_start_loc_cpu[
-                num_decodes : num_reqs + 1
-            ],  # prefill
-            prefill_seq_start_loc=self.seq_start_loc_cpu[
-                num_decodes : num_reqs + 1
-            ],  # prefill
-            prefill_block_tables=block_table_tensor[num_decodes:num_reqs],  # prefill
-            query_start_loc=query_start_loc_cpu[: num_reqs + 1],  # for logits index
+            query_start_loc=query_start_loc,
+            max_seq_len=max_seq_len,
+            seq_lens=seq_lens,
+            block_table=block_table_tensor,
+            slot_mapping=slot_mapping,
+            scheduler_metadata=scheduler_metadata,
+            causal=causal,
+            encoder_cache=encoder_cache_tensor,
+            dynamic_causal=dynamic_casual,
         )
 
         return attn_metadata
 
 
-class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
+class CPUAttentionBackendImpl(AttentionImpl):
     def __init__(
         self,
         num_heads: int,
@@ -445,36 +305,49 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         logits_soft_cap: float | None = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> None:
-        if kv_sharing_target_layer_name is not None:
-            raise NotImplementedError("KV sharing is not supported in V0.")
-        if logits_soft_cap is not None:
-            logger.warning_once(
-                "Torch SPDA does not support logits soft cap. "
-                "Outputs may be slightly off."
-            )
-        self.paged_attn_impl = _get_paged_attn_impl()
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
+        if logits_soft_cap is not None and attn_type in (
+            AttentionType.ENCODER,
+            AttentionType.ENCODER_ONLY,
+        ):
+            logger.warning_once(
+                "CPU_ATTN does not support logits softcap for"
+                " ENCODER and ENCODER_ONLY, outputs may be slightly off"
+            )
+        if logits_soft_cap is None:
+            logits_soft_cap = 0
+        self.logits_soft_cap = logits_soft_cap
+
         self.num_kv_heads = num_kv_heads
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
-        self.sliding_window = sliding_window
+        if sliding_window is None:
+            self.sliding_window = -1
+        else:
+            self.sliding_window = sliding_window
         self.kv_cache_dtype = kv_cache_dtype
-
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
-        self.need_mask = (
-            self.alibi_slopes is not None or self.sliding_window is not None
-        )
 
-        if is_quantized_kv_cache(kv_cache_dtype) and not _use_ipex:
-            raise NotImplementedError(
-                "Torch SDPA backend FP8 KV cache requires "
-                "intel_extension_for_pytorch support."
-            )
         self.attn_type = attn_type
+
+        self.sinks = sinks
+        if self.sinks is not None:
+            assert self.sinks.shape[0] == num_heads, (
+                "Sinks must have the same number of heads as the number of "
+                "heads in the layer"
+            )
+
+        vllm_config = get_current_vllm_config()
+        self.use_zentorch_sdpa = should_use_zentorch_sdpa(
+            attn_type,
+            vllm_config.model_config.dtype,
+        )
 
     def forward(
         self,
@@ -483,464 +356,211 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: TorchSDPAMetadata,  # type: ignore
-        output: torch.Tensor | None = None,
+        attn_metadata: CPUAttentionMetadata | None,
+        output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass with torch SDPA and PagedAttention.
+        """Forward pass for CPU attention backend.
 
         Args:
-            query: shape = [num_tokens, num_heads * head_size]
-            key: shape = [num_tokens, num_kv_heads * head_size]
-            value: shape = [num_tokens, num_kv_heads * head_size]
+            layer: The attention layer, providing the q/k/v quantization scales.
+            query: shape = [num_tokens, num_heads, head_size]
+            key: shape = [num_tokens, num_kv_heads, head_size]
+            value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: shape =
-                [2, num_blocks, block_size * num_kv_heads * head_size]
-                NOTE: kv_cache will be an empty tensor with shape [0]
-                for profiling run.
+                [num_blocks, num_kv_heads, block_size, 2 * head_size]
             attn_metadata: Metadata for attention.
+            output: Tensor that the attention result is written into.
+            output_scale: Scale for fused output quantization; not supported
+                by this backend.
+            output_block_scale: Block scale for fused output quantization;
+                not supported by this backend.
+
         Returns:
             shape = [num_tokens, num_heads * head_size]
+
         """
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
-                " for TorchSDPABackendImpl"
+                " for CPUAttentionBackendImpl"
             )
 
         # For warming-up
         if attn_metadata is None:
-            return query
+            return output
 
-        attn_type = self.attn_type
-        if attn_type == AttentionType.ENCODER and (
-            not attn_metadata.is_all_encoder_attn_metadata_set
-        ):
-            raise AttributeError(
-                "Encoder attention requires setting encoder metadata attributes."
-            )
-        elif attn_type == AttentionType.ENCODER_DECODER and (
-            not attn_metadata.is_all_cross_attn_metadata_set
-        ):
-            raise AttributeError(
-                "Encoder/decoder cross-attention "
-                "requires setting cross-attention "
-                "metadata attributes."
-            )
+        num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Reshape the query, key, and value tensors.
-        query = query.view(-1, self.num_heads, self.head_size)
-        if key is not None:
-            assert value is not None
-            key = key.view(-1, self.num_kv_heads, self.head_size)
-            value = value.view(-1, self.num_kv_heads, self.head_size)
-        else:
-            assert value is None
-
-        if attn_type != AttentionType.ENCODER and kv_cache.numel() > 0:
-            # KV-cache during decoder-self- or
-            # encoder-decoder-cross-attention, but not
-            # during encoder attention.
-            #
-            # Even if there are no new key/value pairs to cache,
-            # we still need to break out key_cache and value_cache
-            # i.e. for later use by paged attention
-            key_cache, value_cache = self.paged_attn_impl.split_kv_cache(
-                kv_cache, self.num_kv_heads, self.head_size
-            )
-
-            if (key is not None) and (value is not None):
-                if attn_type == AttentionType.ENCODER_DECODER:
-                    # Update cross-attention KV cache (prefill-only)
-                    # During cross-attention decode, key & value will be None,
-                    # preventing this IF-statement branch from running
-                    updated_slot_mapping = attn_metadata.cross_slot_mapping
-                else:
-                    # Update self-attention KV cache (prefill/decode)
-                    updated_slot_mapping = attn_metadata.slot_mapping
-
-                self.paged_attn_impl.write_to_paged_cache(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    updated_slot_mapping,
-                    self.kv_cache_dtype,
-                    layer._k_scale,
-                    layer._v_scale,
-                )
-
-        if attn_type != AttentionType.ENCODER:
-            # Decoder self-attention supports chunked prefill.
-            # Encoder/decoder cross-attention requires no chunked
-            # prefill (100% prefill or 100% decode tokens, no mix)
-            num_prefill_tokens = attn_metadata.num_prefill_tokens
-            num_decode_tokens = attn_metadata.num_decode_tokens
-        else:
-            # Encoder attention - chunked prefill is not applicable;
-            # derive token-count from query shape & and treat them
-            # as 100% prefill tokens
-            assert attn_metadata.num_encoder_tokens is not None
-            num_prefill_tokens = attn_metadata.num_encoder_tokens
-            num_decode_tokens = 0
-
-        if attn_type == AttentionType.DECODER:
-            # Only enforce this shape-constraint for decoder
-            # self-attention
-            assert key.shape[0] == num_prefill_tokens + num_decode_tokens
-            assert value.shape[0] == num_prefill_tokens + num_decode_tokens
-
-        output = torch.empty_like(query)
-        if prefill_meta := attn_metadata.prefill_metadata:
-            if not prefill_meta.prefill_metadata.chunked_prefill:  # type: ignore
-                assert attn_metadata.seq_lens is not None
-                self._run_sdpa_forward(
-                    output, query, key, value, prefill_meta, attn_type=attn_type
-                )
-            else:
-                # prefix-enabled attention
-                assert not self.need_mask
-                import intel_extension_for_pytorch.llm.modules as ipex_modules
-
-                output = torch.empty_like(query)
-                ipex_modules.PagedAttention.flash_attn_varlen_func(
-                    output[prefill_meta.num_decode_tokens :, :, :],
-                    query[prefill_meta.num_decode_tokens :, :, :],
-                    key_cache,
-                    value_cache,
-                    prefill_meta.prefill_query_start_loc,
-                    prefill_meta.prefill_seq_start_loc,
-                    prefill_meta.max_query_len,
-                    prefill_meta.prefill_max_seq_len,
+        is_encoder_attention = self.attn_type in (
+            AttentionType.ENCODER_ONLY,
+            AttentionType.ENCODER,
+        )
+        if is_encoder_attention:
+            if self.use_zentorch_sdpa:
+                # Encoder attention never reads the KV cache back, so the
+                # zentorch path attends the packed QKV directly instead of
+                # staging it through the scratch encoder cache.
+                zentorch_sdpa_attn(
+                    query[:num_actual_tokens],
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    output[:num_actual_tokens],
+                    attn_metadata,
                     self.scale,
-                    True,
-                    prefill_meta.prefill_block_tables,
+                    self.sliding_window,
                     self.alibi_slopes,
                 )
+                return output
+            # For encoder attention,
+            kv_cache = attn_metadata.encoder_cache
 
-        if decode_meta := attn_metadata.decode_metadata:
-            assert attn_type != AttentionType.ENCODER_ONLY, (
-                "Encoder-only models should not have decode metadata."
-            )
-            # Decoding run.
-            (
-                seq_lens_arg,
-                max_seq_len_arg,
-                block_tables_arg,
-            ) = decode_meta.get_seq_len_block_table_args(attn_type)
+        # KV cache size are [num_blocks, num_kv_heads, block_size,
+        # 2 * head_size]. Make a view [num_blocks, num_kv_heads,
+        # block_size * 2, head_size]. Then slice KV at dim 2
+        num_blocks, num_kv_heads, block_size, _ = kv_cache.size()
+        kv_cache = kv_cache.view((num_blocks, num_kv_heads, block_size * 2, -1))
+        key_cache, value_cache = kv_cache.chunk(2, dim=2)
 
-            self.paged_attn_impl.forward_decode(
-                output[: attn_metadata.num_decode_tokens, :, :],
-                query[: attn_metadata.num_decode_tokens, :, :],
+        if is_encoder_attention:
+            ops.cpu_attn_reshape_and_cache(
+                key,
+                value,
                 key_cache,
                 value_cache,
-                block_tables_arg,
-                seq_lens_arg,
-                max_seq_len_arg,
-                self.kv_cache_dtype,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-                layer._k_scale,
-                layer._v_scale,
+                attn_metadata.slot_mapping,
+                layer.isa,  # type: ignore
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                kv_cache_dtype=self.kv_cache_dtype,
             )
 
-        # Reshape the output tensor.
-        return output.view(-1, self.num_heads * self.head_size)
+        # The CPU kernel executes attention sinks natively in bf16. If the
+        # sinks tensor is anything other than bf16, cast it to fp32 so it is
+        # executed in full float precision (done lazily here, after weights
+        # are loaded, rather than at __init__ time).
+        if self.sinks is not None and self.sinks.dtype not in [
+            torch.bfloat16,
+            torch.float32,
+        ]:
+            self.sinks = self.sinks.to(torch.float32)
+        ops.cpu_attention_with_kv_cache(
+            query=query[:num_actual_tokens],
+            key_cache=key_cache,
+            value_cache=value_cache,
+            output=output[:num_actual_tokens],  # type: ignore
+            query_start_loc=attn_metadata.query_start_loc,
+            seq_lens=attn_metadata.seq_lens,
+            scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,  # type: ignore
+            sliding_window=self.sliding_window,
+            block_table=attn_metadata.block_table,
+            softcap=self.logits_soft_cap,
+            scheduler_metadata=attn_metadata.scheduler_metadata,
+            s_aux=self.sinks,
+            dynamic_causal=attn_metadata.dynamic_causal,
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
 
-    def _run_sdpa_forward(
+        return output
+
+    def do_kv_cache_update(
         self,
-        output: torch.Tensor,
-        query: torch.Tensor,
+        layer: torch.nn.Module,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: TorchSDPAMetadata,
-        attn_type: str = AttentionType.DECODER,
-    ) -> None:
-        attn_masks = attn_metadata.get_attn_bias(attn_type)
-        if attn_masks is None:
-            if self.alibi_slopes is not None:
-                attn_masks = _make_alibi_bias(
-                    self.alibi_slopes,
-                    query.dtype,
-                    attn_metadata.seq_lens,  # type: ignore
-                )
-            elif self.sliding_window is not None:
-                assert attn_metadata.seq_lens is not None
-                attn_masks = _make_sliding_window_bias(
-                    attn_metadata.seq_lens, self.sliding_window, query.dtype
-                )
-            else:
-                seq_lens, _ = attn_metadata.get_seq_lens(attn_type)
-                attn_masks = [None] * len(seq_lens)
-            attn_metadata.set_attn_bias(attn_masks, attn_type)
-
-        query = query.movedim(0, query.dim() - 2)
-        key = key.movedim(0, key.dim() - 2)
-        value = value.movedim(0, value.dim() - 2)
-
-        if self.num_kv_heads != self.num_heads:
-            key = key.repeat_interleave(self.num_queries_per_kv, dim=-3)
-            value = value.repeat_interleave(self.num_queries_per_kv, dim=-3)
-
-        causal_attn = attn_type == AttentionType.DECODER
-
-        seq_lens_q, seq_lens_kv = attn_metadata.get_seq_lens(attn_type)
-        start_q, start_kv = 0, 0
-        for seq_len_q, seq_len_kv, mask in zip(seq_lens_q, seq_lens_kv, attn_masks):
-            end_q = start_q + seq_len_q
-            end_kv = start_kv + seq_len_kv
-            sub_out = (
-                scaled_dot_product_attention(
-                    query[None, :, start_q:end_q, :],
-                    key[None, :, start_kv:end_kv, :],
-                    value[None, :, start_kv:end_kv, :],
-                    attn_mask=mask,
-                    dropout_p=0.0,
-                    is_causal=causal_attn and mask is None,
-                    scale=self.scale,
-                )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
-            output[start_q:end_q, :, :] = sub_out
-            start_q, start_kv = end_q, end_kv
-
-
-def _make_alibi_bias(
-    alibi_slopes: torch.Tensor,
-    dtype: torch.dtype,
-    seq_lens: list[int],
-) -> list[torch.Tensor]:
-    attn_biases: list[torch.Tensor] = []
-    for seq_len in seq_lens:
-        bias = torch.arange(seq_len, dtype=dtype)
-        # NOTE(zhuohan): HF uses
-        #     `bias = bias[None, :].repeat(seq_len, 1)`
-        # here. We find that both biases give the same results, but
-        # the bias below more accurately follows the original ALiBi
-        # paper.
-        bias = bias[None, :] - bias[:, None]
-
-        num_heads = alibi_slopes.shape[0]
-        bias = bias[None, :].repeat((num_heads, 1, 1))
-        bias.mul_(alibi_slopes[:, None, None]).unsqueeze_(0)
-        inf_mask = (
-            torch.empty((1, seq_len, seq_len), dtype=bias.dtype)
-            .fill_(-torch.inf)
-            .triu_(diagonal=1)
-        )
-        attn_biases.append((bias + inf_mask).to(dtype))
-
-    return attn_biases
-
-
-def _make_sliding_window_bias(
-    seq_lens: list[int],
-    window_size: int | None,
-    dtype: torch.dtype,
-) -> list[torch.Tensor]:
-    attn_biases: list[torch.Tensor] = []
-    for seq_len in seq_lens:
-        tensor = torch.full(
-            (1, seq_len, seq_len),
-            dtype=dtype,
-            fill_value=1,
-        )
-        shift = 0
-        mask = torch.tril(tensor, diagonal=shift).to(dtype)  # type: ignore
-        if window_size is not None:
-            mask = torch.triu(mask, diagonal=shift - window_size + 1)
-        mask = torch.log(mask)
-        attn_biases.append(mask.to(dtype))
-
-    return attn_biases
-
-
-class _PagedAttention:
-    @staticmethod
-    def validate_head_size(head_size: int) -> tuple[bool, list[int]]:
-        SUPPORT_HS = [32, 64, 80, 96, 112, 128, 192, 256]
-        return head_size in SUPPORT_HS, SUPPORT_HS
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        *args,
-    ) -> tuple[int, ...]:
-        return 2, num_blocks, block_size * num_kv_heads * head_size
-
-    @staticmethod
-    def split_kv_cache(
         kv_cache: torch.Tensor,
-        num_kv_heads: int,
-        head_size: int,
-        *args,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = 16 // kv_cache.element_size()
-        num_blocks = kv_cache.shape[1]
-
-        key_cache = kv_cache[0]
-        key_cache = key_cache.view(num_blocks, num_kv_heads, head_size // x, -1, x)
-        value_cache = kv_cache[1]
-        value_cache = value_cache.view(num_blocks, num_kv_heads, head_size, -1)
-        return key_cache, value_cache
-
-    @staticmethod
-    def write_to_paged_cache(
-        key: torch.Tensor,
-        value: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
-        kv_cache_dtype: str,
-        k_scale: torch.Tensor,
-        v_scale: torch.Tensor,
-        *args,
     ) -> None:
-        ops.reshape_and_cache(
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return
+
+        num_blocks, num_kv_heads, block_size, _ = kv_cache.size()
+        kv_cache = kv_cache.view((num_blocks, num_kv_heads, block_size * 2, -1))
+        key_cache, value_cache = kv_cache.chunk(2, dim=2)
+        ops.cpu_attn_reshape_and_cache(
             key,
             value,
             key_cache,
             value_cache,
-            slot_mapping.flatten(),
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-        )
-
-    @staticmethod
-    def forward_decode(
-        output: torch.Tensor,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_tables: torch.Tensor,
-        context_lens: torch.Tensor,
-        max_context_len: int,
-        kv_cache_dtype: str,
-        num_kv_heads: int,
-        scale: float,
-        alibi_slopes: torch.Tensor | None,
-        k_scale: torch.Tensor,
-        v_scale: torch.Tensor,
-        *args,
-    ) -> None:
-        tp_rank: int = 0
-        blocksparse_local_blocks: int = 0
-        blocksparse_vert_stride: int = 0
-        blocksparse_block_size: int = 64
-        blocksparse_head_sliding_step: int = 0
-        block_size = value_cache.shape[3]
-
-        ops.paged_attention_v1(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            num_kv_heads,
-            scale,
-            block_tables,
-            context_lens,
-            block_size,
-            max_context_len,
-            alibi_slopes,
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-            tp_rank,
-            blocksparse_local_blocks,
-            blocksparse_vert_stride,
-            blocksparse_block_size,
-            blocksparse_head_sliding_step,
+            slot_mapping,
+            layer.isa,  # type: ignore
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
 
 
-class _IPEXPagedAttention(_PagedAttention):
-    @staticmethod
-    def validate_head_size(head_size: int) -> tuple[bool, list[int]]:
-        return True, []
+@functools.lru_cache(maxsize=1)
+def _riscv_supports_rvv() -> bool:
+    """Whether the C++ RVV attention path is usable.
 
-    @staticmethod
-    def split_kv_cache(
-        kv_cache: torch.Tensor,
-        num_kv_heads: int,
-        head_size: int,
-        *args,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_blocks = kv_cache.shape[1]
+    The kernel in csrc/cpu/cpu_attn_rvv.hpp uses VLEN-agnostic RVVI()
+    macros and supports VLEN=128 and VLEN=256.  CMake auto-detects the
+    largest zvl<N>b from /proc/cpuinfo and passes it via -mrvv-vector-bits.
+    The RVV path is compiled whenever __riscv_v_min_vlen is defined, so
+    we check that at least one supported zvl<N>b is advertised.
+    """
+    # The C++ compile-time check is the ground truth: it knows which
+    # VLEN the binary was actually compiled for.  The cpuinfo check
+    # below is only a fast-path shortcut.
+    try:
+        import torch
 
-        key_cache = kv_cache[0]
-        key_cache = key_cache.view(num_blocks, num_kv_heads, -1, head_size)
-        value_cache = kv_cache[1]
-        value_cache = value_cache.view(num_blocks, num_kv_heads, -1, head_size)
-        return key_cache, value_cache
+        if torch.ops._C.cpu_attn_has_isa("rvv"):
+            return True
+    except Exception:
+        pass
 
-    @staticmethod
-    def write_to_paged_cache(
-        key: torch.Tensor,
-        value: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        kv_cache_dtype: str,
-        k_scale: torch.Tensor,
-        v_scale: torch.Tensor,
-        *args,
-    ) -> None:
-        ipex_modules.PagedAttention.reshape_and_cache(
-            key, value, key_cache, value_cache, slot_mapping.flatten().int()
-        )
+    # Fallback: check /proc/cpuinfo for zvl128b/zvl256b.
+    try:
+        with open("/proc/cpuinfo") as f:
+            cpuinfo = f.read()
+    except OSError:
+        return False
+    return any(f"zvl{n}b" in cpuinfo for n in (128, 256))
 
-    @staticmethod
-    def forward_decode(
-        output: torch.Tensor,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_tables: torch.Tensor,
-        context_lens: torch.Tensor,
-        max_context_len: int,
-        kv_cache_dtype: str,
-        num_kv_heads: int,
-        scale: float,
-        alibi_slopes: torch.Tensor | None,
-        k_scale: torch.Tensor,
-        v_scale: torch.Tensor,
-        *args,
-    ) -> None:
-        block_size = value_cache.shape[2]
-        head_mapping = (
-            torch.arange(
-                0,
-                num_kv_heads,
-                device="cpu",
-                dtype=torch.int32,
+
+def _get_attn_isa(
+    dtype: torch.dtype,
+    block_size: int,
+    head_size: int | None = None,
+    kv_cache_dtype: str | None = None,
+) -> str:
+    fp8_kv = is_quantized_kv_cache(kv_cache_dtype) if kv_cache_dtype else False
+    if head_size is not None and head_size % 32 != 0 and head_size % 16 == 0:
+        if fp8_kv:
+            raise NotImplementedError(
+                "FP8 KV cache requires head_size divisible by 32 on CPU."
             )
-            .view(num_kv_heads, 1)
-            .repeat_interleave(query.size(1) // num_kv_heads)
-            .flatten()
+        return "vec16"
+    supports_amx = torch.cpu._is_amx_tile_supported()
+    arch = current_platform.get_cpu_architecture()
+    supports_arm = arch == CpuArchEnum.ARM
+    supports_vxe = arch == CpuArchEnum.S390X
+    supports_riscv = arch == CpuArchEnum.RISCV
+    supports_vsx = arch == CpuArchEnum.POWERPC
+    supports_avx512 = torch.cpu._is_avx512_supported()
+    if fp8_kv and not supports_amx and not supports_avx512:
+        raise NotImplementedError(
+            "FP8 KV cache on CPU requires x86 with AVX-512 or AMX."
         )
-        ipex_modules.PagedAttention.single_query_cached_kv_attention(
-            output,
-            query.contiguous(),
-            key_cache,
-            value_cache,
-            head_mapping,
-            scale,
-            block_tables,
-            context_lens,
-            block_size,
-            max_context_len,
-            alibi_slopes,
-        )
-
-
-def _get_paged_attn_impl():
-    if _use_ipex:
-        return _IPEXPagedAttention
+    if supports_amx and dtype in (torch.bfloat16,) and block_size % 32 == 0:
+        return "amx"
+    elif supports_arm:
+        return "neon"
+    elif block_size % 32 == 0:
+        if supports_riscv and _riscv_supports_rvv():
+            return "rvv"
+        elif supports_vxe:
+            return "vxe"
+        elif supports_vsx:
+            return "vsx"
+        else:
+            return "vec"
     else:
-        return _PagedAttention
+        return "vec16"

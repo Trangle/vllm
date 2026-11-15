@@ -2,13 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-from pydantic.dataclasses import dataclass
+from typing import Literal
 
 from vllm.config.utils import config
 
 
 @config
-@dataclass
 class KVEventsConfig:
     """Configuration for KV event publishing."""
 
@@ -17,7 +16,7 @@ class KVEventsConfig:
     Events can be published externally by zmq using the event publisher config.
     """
 
-    publisher: str = "null"
+    publisher: Literal["null", "zmq"] = None  # type: ignore[assignment]
     """The publisher to use for publishing kv events. Can be "null", "zmq".
     """
 
@@ -32,6 +31,8 @@ class KVEventsConfig:
     buffer_steps: int = 10_000
     """The number of steps to cache for replay endpoint. Will only save
     events from the last N steps for the replay endpoint.
+
+    The replay socket's send high-water mark is 2 * (buffer_steps + 1).
     """
 
     hwm: int = 100_000
@@ -47,3 +48,7 @@ class KVEventsConfig:
     """The topic to use for the event publisher. Consumers can subscribe to
     this topic to receive events.
     """
+
+    def __post_init__(self):
+        if self.publisher is None:
+            self.publisher = "zmq" if self.enable_kv_cache_events else "null"

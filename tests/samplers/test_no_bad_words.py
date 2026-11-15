@@ -8,11 +8,12 @@ Run `pytest tests/samplers/test_no_bad_words.py`.
 
 from transformers import AutoTokenizer
 
-from vllm import LLM, SamplingParams
+from tests.conftest import VllmRunner
+from vllm import SamplingParams
 
 
 def _generate(
-    llm: LLM,
+    llm: VllmRunner,
     prompt: str,
     num_prompt_tokens: int,
     temperature: float = 0,
@@ -35,15 +36,13 @@ def _generate(
 
 
 class TestOneTokenBadWord:
-    MODEL = "TheBloke/Llama-2-7B-fp16"
+    MODEL = "vllm-project/tiny-random-LlamaForCausalLM"
 
-    PROMPT = "Hi! How are"
-    TARGET_TOKEN = "you"
+    PROMPT = "How old are "
+    TARGET_TOKEN = "mn"
 
     def setup_method(self, method):
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.MODEL, add_prefix_space=True
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL)
 
         self.num_prompt_tokens = len(self._encode(self.PROMPT))
         self.target_token_id = self._encode(
@@ -58,7 +57,9 @@ class TestOneTokenBadWord:
             output_token_ids = self._generate(llm, bad_words=[self.TARGET_TOKEN])
             assert self.target_token_id not in output_token_ids
 
-    def _generate(self, llm: LLM, bad_words: list[str] | None = None) -> list[int]:
+    def _generate(
+        self, llm: VllmRunner, bad_words: list[str] | None = None
+    ) -> list[int]:
         return _generate(
             llm=llm,
             prompt=self.PROMPT,
@@ -153,7 +154,9 @@ class TestTwoTokenBadWord:
                 self.neighbour_token_id2 in output_token_ids
             )
 
-    def _generate(self, llm: LLM, bad_words: list[str] | None = None) -> list[int]:
+    def _generate(
+        self, llm: VllmRunner, bad_words: list[str] | None = None
+    ) -> list[int]:
         return _generate(
             llm=llm,
             prompt=self.PROMPT,

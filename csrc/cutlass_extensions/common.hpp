@@ -3,16 +3,19 @@
 #include "cutlass/cutlass.h"
 #include <climits>
 #include "cuda_runtime.h"
-#include <iostream>
+#include <cstdio>
+#include <cstdlib>
+
+#include <torch/headeronly/util/shim_utils.h>
 
 /**
  * Helper function for checking CUTLASS errors
  */
-#define CUTLASS_CHECK(status)                       \
-  {                                                 \
-    cutlass::Status error = status;                 \
-    TORCH_CHECK(error == cutlass::Status::kSuccess, \
-                cutlassGetStatusString(error));     \
+#define CUTLASS_CHECK(status)                           \
+  {                                                     \
+    cutlass::Status error = status;                     \
+    STD_TORCH_CHECK(error == cutlass::Status::kSuccess, \
+                    cutlassGetStatusString(error));     \
   }
 
 inline int get_cuda_max_shared_memory_per_block_opt_in(int const device) {
@@ -22,7 +25,15 @@ inline int get_cuda_max_shared_memory_per_block_opt_in(int const device) {
   return max_shared_mem_per_block_opt_in;
 }
 
-int32_t get_sm_version_num();
+inline int32_t get_sm_version_num() {
+  int32_t major_capability, minor_capability;
+  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
+                         0);
+  cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
+                         0);
+  int32_t version_num = major_capability * 10 + minor_capability;
+  return version_num;
+}
 
 /**
  * A wrapper for a kernel that is used to guard against compilation on
@@ -31,42 +42,94 @@ int32_t get_sm_version_num();
  * __CUDA_ARCH__ is not defined in host code, so this lets us smuggle the ifdef
  * into code that will be executed on the device where it is defined.
  */
+
+template <typename Kernel>
+struct enable_sm75_to_sm80 : Kernel {
+  template <typename... Args>
+  CUTLASS_DEVICE static void invoke(Args&&... args) {
+#if defined __CUDA_ARCH__
+  #if __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 800
+    Kernel::invoke(std::forward<Args>(args)...);
+  #else
+    printf("This kernel only supports sm[75, 80).\n");
+    asm("trap;");
+  #endif
+#endif
+  }
+};
+
+template <typename Kernel>
+struct enable_sm80_to_sm89 : Kernel {
+  template <typename... Args>
+  CUTLASS_DEVICE static void invoke(Args&&... args) {
+#if defined __CUDA_ARCH__
+  #if __CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 890
+    Kernel::invoke(std::forward<Args>(args)...);
+  #else
+    printf("This kernel only supports sm[80, 89).\n");
+    asm("trap;");
+  #endif
+#endif
+  }
+};
+
+template <typename Kernel>
+struct enable_sm89_to_sm90 : Kernel {
+  template <typename... Args>
+  CUTLASS_DEVICE static void invoke(Args&&... args) {
+#if defined __CUDA_ARCH__
+  #if __CUDA_ARCH__ >= 890 && __CUDA_ARCH__ < 900
+    Kernel::invoke(std::forward<Args>(args)...);
+  #else
+    printf("This kernel only supports sm[89, 90).\n");
+    asm("trap;");
+  #endif
+#endif
+  }
+};
+
 template <typename Kernel>
 struct enable_sm90_or_later : Kernel {
   template <typename... Args>
   CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 900
+#if defined __CUDA_ARCH__
+  #if __CUDA_ARCH__ >= 900
     Kernel::operator()(std::forward<Args>(args)...);
+  #else
+    printf("This kernel only supports sm >= 90.\n");
+    asm("trap;");
+  #endif
 #endif
   }
 };
 
 template <typename Kernel>
-struct enable_sm90_only : Kernel {
+struct enable_sm100_to_sm120 : Kernel {
   template <typename... Args>
   CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ == 900
+#if defined __CUDA_ARCH__
+  #if (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)
     Kernel::operator()(std::forward<Args>(args)...);
+  #else
+    printf("This kernel only supports sm[100, 120).\n");
+    asm("trap;");
+  #endif
 #endif
   }
 };
 
+// SM12x family includes SM120 (RTX 5090) and SM121 (DGX Spark GB10)
 template <typename Kernel>
-struct enable_sm100_only : Kernel {
+struct enable_sm120_family : Kernel {
   template <typename... Args>
   CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ == 1000
+#if defined __CUDA_ARCH__
+  #if (__CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300)
     Kernel::operator()(std::forward<Args>(args)...);
-#endif
-  }
-};
-
-template <typename Kernel>
-struct enable_sm120_only : Kernel {
-  template <typename... Args>
-  CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ == 1200
-    Kernel::operator()(std::forward<Args>(args)...);
+  #else
+    printf("This kernel only supports sm120f.\n");
+    asm("trap;");
+  #endif
 #endif
   }
 };

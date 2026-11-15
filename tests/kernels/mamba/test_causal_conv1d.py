@@ -2,17 +2,31 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from collections.abc import Iterator
+
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+DEVICE = current_platform.device_type
+
+pytestmark = pytest.mark.skipif(
+    not (
+        current_platform.is_cuda_alike()
+        or current_platform.is_xpu()
+        or current_platform.is_cpu()
+    ),
+    reason="causal_conv1d Triton kernels require CUDA-alike, XPU, or CPU",
+)
 
 
 def causal_conv1d_ref(
@@ -24,8 +38,7 @@ def causal_conv1d_ref(
     final_states_out: torch.Tensor | None = None,
     activation: str | None = "silu",
 ):
-    """
-    x: (batch, dim, seqlen)
+    """x: (batch, dim, seqlen)
     weight: (dim, width)
     bias: (dim,)
     initial_states: (batch, dim, width - 1)
@@ -60,8 +73,7 @@ def causal_conv1d_ref(
 def causal_conv1d_update_ref(
     x, conv_state, weight, bias=None, activation=None, cache_seqlens=None
 ):
-    """
-    x: (batch, dim) or (batch, dim, seqlen)
+    """x: (batch, dim) or (batch, dim, seqlen)
     conv_state: (batch, dim, state_len), where state_len >= width - 1
     weight: (dim, width)
     bias: (dim,)
@@ -110,62 +122,50 @@ def causal_conv1d_update_ref(
     return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
 
 
-@pytest.mark.parametrize("itype", [torch.bfloat16, torch.float])
-@pytest.mark.parametrize("silu_activation", [True])
-@pytest.mark.parametrize("has_bias", [True])
-def causal_conv1d_opcheck_fn(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    cu_seq_len: torch.Tensor | None = None,
-    cache_indices: torch.Tensor | None = None,
-    has_initial_state: torch.Tensor | None = None,
-    conv_states: torch.Tensor | None = None,
-    activation: str | None = "silu",
-    pad_slot_id: int = PAD_SLOT_ID,
-):
-    """
-    x: (batch, dim, seqlen)
-    weight: (dim, width)
-    bias: (dim,)
-    seq_idx: (batch, seqlen)
-    initial_states: (batch, dim, width - 1)
-    final_states_out: (batch, dim, width - 1), to be written to
-    activation: either None or "silu" or "swish"
-
-    out: (batch, dim, seqlen)
-    """
-    if activation not in [None, "silu", "swish"]:
-        raise NotImplementedError("activation must be None, silu, or swish")
-    if x.stride(-1) != 1:
-        x = x.contiguous()
-    bias = bias.contiguous() if bias is not None else None
+@pytest.mark.parametrize("width", [1, 8])
+@pytest.mark.skipif(
+    current_platform.is_cpu(),
+    reason="The width check lives in the Triton wrappers, which CPU bypasses.",
+)
+def test_causal_conv1d_rejects_unsupported_width(width):
+    # The kernels branch on widths 2 to 7; any other width would compute
+    # wrong values silently.
+    dim = 8
+    weight = torch.randn(dim, width, device=DEVICE)
+    conv_state = torch.zeros(1, dim, 7, device=DEVICE)
+    x = torch.randn(dim, 1, device=DEVICE)
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+    with pytest.raises(ValueError, match="widths 2 to 7"):
+        causal_conv1d_fn(x, weight, None, conv_state, query_start_loc)
+    with pytest.raises(ValueError, match="widths 2 to 7"):
+        causal_conv1d_update(x.T.contiguous(), conv_state, weight)
 
 
 @pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("seqlen", [1])
-@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("width", [4, 7])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, itype):
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
     # set seed
-    current_platform.seed_everything(0)
+    set_random_seed(0)
     batch = 2
     x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
     x_ref = x.clone()
-    conv_state = torch.randn(batch, dim, width - 1, device=device, dtype=itype)
+    # +1 entry to reserve index 0 as null block
+    conv_state = torch.randn(batch + 1, dim, width - 1, device=device, dtype=itype)
 
     weight = torch.randn(dim, width, device=device, dtype=itype)
     bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
-    conv_state_ref = conv_state.detach().clone()
+    # Start indices from 1, skipping null block at index 0
+    conv_state_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
+    conv_state_ref = conv_state[conv_state_indices].detach().clone()
     activation = None if not silu_activation else "silu"
-
-    conv_state_indices = torch.arange(batch, dtype=torch.int32, device=device)
 
     out = causal_conv1d_update(
         x,
@@ -179,7 +179,7 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
         x_ref, conv_state_ref, weight, bias, activation=activation
     )
 
-    assert torch.equal(conv_state, conv_state_ref)
+    assert torch.equal(conv_state[conv_state_indices], conv_state_ref)
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
@@ -187,7 +187,7 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("seqlen", [1, 3])
-@pytest.mark.parametrize("width", [3, 4])
+@pytest.mark.parametrize("width", [3, 4, 7])
 @pytest.mark.parametrize("dim", [2048 + 16, 4096])
 # tests correctness in case subset of the sequences are padded
 @pytest.mark.parametrize("with_padding", [True, False])
@@ -195,13 +195,13 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
 def test_causal_conv1d_update_with_batch_gather(
     batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation, itype
 ):
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
 
     # set seed
-    current_platform.seed_everything(0)
+    set_random_seed(0)
 
     padding = 5 if with_padding else 0
     padded_batch_size = batch_size + padding
@@ -215,7 +215,8 @@ def test_causal_conv1d_update_with_batch_gather(
 
     x_ref = x.clone()
 
-    conv_state_indices = torch.randperm(total_entries)[:batch_size].to(
+    # +1 to exclude index 0 (null block)
+    conv_state_indices = (torch.randperm(total_entries - 1)[:batch_size] + 1).to(
         dtype=torch.int32, device=device
     )
     unused_states_bool = torch.ones(total_entries, dtype=torch.bool, device=device)
@@ -223,7 +224,9 @@ def test_causal_conv1d_update_with_batch_gather(
     padded_state_indices = torch.concat(
         [
             conv_state_indices,
-            torch.as_tensor([PAD_SLOT_ID] * padding, dtype=torch.int32, device=device),
+            torch.as_tensor(
+                [NULL_BLOCK_ID] * padding, dtype=torch.int32, device=device
+            ),
         ],
         dim=0,
     )
@@ -248,7 +251,6 @@ def test_causal_conv1d_update_with_batch_gather(
         bias,
         activation=activation,
         conv_state_indices=padded_state_indices,
-        pad_slot_id=PAD_SLOT_ID,
     )
     out_ref = causal_conv1d_update_ref(
         x_ref[:batch_size], conv_state_ref, weight, bias, activation=activation
@@ -264,7 +266,7 @@ def test_causal_conv1d_update_with_batch_gather(
 @pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])
-@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("width", [4, 5, 6, 7])
 @pytest.mark.parametrize("seqlen", [8, 249, 4096])
 @pytest.mark.parametrize("dim", [64, 4096])
 @pytest.mark.parametrize("with_padding", [True, False])
@@ -272,13 +274,14 @@ def test_causal_conv1d_update_with_batch_gather(
 def test_causal_conv1d_varlen(
     batch, with_padding, dim, seqlen, width, has_bias, silu_activation, itype
 ):
-    device = "cuda"
-    torch.cuda.empty_cache()
+    device = DEVICE
+    if not current_platform.is_cpu():
+        torch.accelerator.empty_cache()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
     # set seed
-    current_platform.seed_everything(0)
+    set_random_seed(0)
     seqlens = []
     batch_size = batch
     padding = 3 if with_padding else 0
@@ -317,13 +320,19 @@ def test_causal_conv1d_varlen(
     has_initial_states = torch.randint(
         0, 2, (cumsum.shape[0] - 1,), dtype=torch.bool, device=x.device
     )
-    state_indices = torch.randperm(total_entries, dtype=torch.int32, device=x.device)[
-        :batch_size
-    ]
+    # +1 to exclude index 0 (null block)
+    state_indices = (
+        torch.randperm(total_entries - 1, dtype=torch.int32, device=x.device)[
+            :batch_size
+        ]
+        + 1
+    )
     padded_state_indices = torch.concat(
         [
             state_indices,
-            torch.as_tensor([PAD_SLOT_ID] * padding, dtype=torch.int32, device=device),
+            torch.as_tensor(
+                [NULL_BLOCK_ID] * padding, dtype=torch.int32, device=device
+            ),
         ],
         dim=-1,
     )
@@ -332,11 +341,10 @@ def test_causal_conv1d_varlen(
         weight,
         bias=bias,
         conv_states=final_states,
-        query_start_loc=cumsum.cuda(),
+        query_start_loc=cumsum.to(device),
         cache_indices=padded_state_indices,
         has_initial_state=has_initial_states,
         activation=activation,
-        pad_slot_id=PAD_SLOT_ID,
     )
 
     out_ref = []
@@ -345,7 +353,7 @@ def test_causal_conv1d_varlen(
     splits = [torch.split(var, seqlens[0], dim=-1) for var in (x_ref)]
     for i in range(len(seqlens[0])):
         x_s = [v[i].unsqueeze(0) for v in splits][0]
-        if padded_state_indices[i] == PAD_SLOT_ID:
+        if padded_state_indices[i] == NULL_BLOCK_ID:
             continue
         out_ref_b.append(
             causal_conv1d_ref(
@@ -371,3 +379,113 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("itype", [torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [True])
+@pytest.mark.parametrize("has_bias", [True])
+@pytest.mark.parametrize("width", [4, 7])
+@pytest.mark.parametrize("dim", [64, 2048])
+@pytest.mark.parametrize("q_lens_cfg", [[3, 1, 0, 4, 2], [1, 5, 5, 1], [2, 0, 0, 3]])
+@pytest.mark.skipif(
+    current_platform.is_cpu(),
+    reason="CPU kernel for causal_conv1d_update ignores num_accepted_tokens.",
+)
+def test_causal_conv1d_update_ragged_varlen(
+    q_lens_cfg, dim, width, has_bias, silu_activation, itype
+):
+    mk_inputs = lambda: _create_ragged_varlen_inputs(
+        q_lens_cfg, dim, width, has_bias, silu_activation, itype
+    )
+    inputs, state = mk_inputs()
+    actual = causal_conv1d_update(conv_state=state, **inputs)
+
+    ref_inputs, ref_state = mk_inputs()
+    ref_outs = _create_ragged_varlen_ref_outs(conv_state=ref_state, **ref_inputs)
+
+    for i, ref_out in enumerate(ref_outs):
+        start = int(inputs["query_start_loc"][i])
+        end = int(inputs["query_start_loc"][i + 1])
+        entry = inputs["conv_state_indices"][i : i + 1]
+        assert torch.allclose(actual[start:end], ref_out, rtol=1e-2, atol=5e-2)
+        assert torch.equal(state[entry], ref_state[entry])
+
+
+def _create_ragged_varlen_inputs(
+    q_lens_cfg, dim, width, has_bias, silu_activation, itype
+):
+    device = DEVICE
+    set_random_seed(0)
+
+    batch_size = len(q_lens_cfg)
+    max_query_len = 5
+    assert max(q_lens_cfg) <= max_query_len
+    state_len = width - 1 + max_query_len
+    total_entries = 10 * batch_size
+
+    q_lens = torch.tensor(q_lens_cfg, dtype=torch.int32, device=device)
+    query_start_loc = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(q_lens, dim=0, dtype=torch.int32),
+        ]
+    )
+    total_tokens = int(q_lens.sum())
+
+    x = torch.randn(total_tokens, dim, device=device, dtype=itype)
+    conv_state = torch.randn(
+        total_entries, state_len, dim, device=device, dtype=itype
+    ).transpose(1, 2)
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    activation = None if not silu_activation else "silu"
+
+    conv_state_indices = (
+        torch.randperm(total_entries - 1, device=device)[:batch_size] + 1
+    ).to(torch.int32)
+    num_accepted_tokens = torch.randint(
+        1, max_query_len + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    inputs = dict(
+        x=x,
+        weight=weight,
+        bias=bias,
+        activation=activation,
+        conv_state_indices=conv_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        query_start_loc=query_start_loc,
+        max_query_len=max_query_len,
+    )
+    return inputs, conv_state
+
+
+def _create_ragged_varlen_ref_outs(
+    x,
+    conv_state,
+    weight,
+    bias,
+    activation,
+    conv_state_indices,
+    num_accepted_tokens,
+    query_start_loc,
+    max_query_len,
+) -> Iterator[torch.Tensor]:
+    for seq_idx in range(len(conv_state_indices)):
+        start = int(query_start_loc[seq_idx])
+        end = int(query_start_loc[seq_idx + 1])
+        entry = conv_state_indices[seq_idx : seq_idx + 1]
+        if start == end:
+            yield x[start:end]
+            continue
+        out_ref = causal_conv1d_update(
+            x[start:end],
+            conv_state,
+            weight,
+            bias,
+            activation=activation,
+            conv_state_indices=entry,
+            num_accepted_tokens=num_accepted_tokens[seq_idx : seq_idx + 1],
+            query_start_loc=query_start_loc.new_tensor([0, end - start]),
+            max_query_len=max_query_len,
+        )
+        yield out_ref

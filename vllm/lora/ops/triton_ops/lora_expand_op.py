@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Based on:
+"""Based on:
 Chen, L., Ye, Z., Wu, Y., Zhuo, D., Ceze, L., & Krishnamurthy, A. (2023).
 Punica: Multi-Tenant LoRA Serving.
 https://arxiv.org/abs/2310.18547
@@ -9,10 +8,16 @@ https://arxiv.org/abs/2310.18547
 
 import torch
 
+from vllm import envs
 from vllm.lora.ops.triton_ops.kernel_utils import do_expand_kernel
-from vllm.lora.ops.triton_ops.utils import _get_lora_b_ptr
+from vllm.lora.ops.triton_ops.utils import (
+    _get_lora_b_ptr,
+    get_lora_op_configs,
+    supports_pdl,
+)
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils import direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @triton.jit
@@ -45,6 +50,8 @@ def _lora_expand_kernel(
     CAST_TYPE: tl.constexpr,
     SLICE_NUM: tl.constexpr,
     SAME_STRIDE: tl.constexpr,
+    USE_GDC: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ):
     cta_n_num = tl.cdiv(N, BLOCK_N)
     cta_m_num = tl.cdiv(M, BLOCK_M)
@@ -121,6 +128,7 @@ def _lora_expand_kernel(
         EVEN_K,
         CAST_TYPE,
         ADD_INPUTS,
+        USE_GDC,
     )
 
 
@@ -135,35 +143,35 @@ def _lora_expand(
     lora_token_start_loc: torch.Tensor,  # shape [max-loras + 2]
     lora_ids: torch.Tensor,  # shape [max-loras + 1]
     no_lora_flag_cpu: torch.Tensor,  # shape [1]
+    num_active_loras: torch.Tensor,  # CPU tensor [1], number of active LoRAs
     offset_start: int = 0,
     add_inputs: bool = False,
 ) -> None:
-    """
-    Args:
-        inputs (torch.Tensor): input tensor
-        lora_b_weights (list[torch.Tensor]): lora'b weight
-        output_tensor (torch.Tensor): output tensor
-        token_lora_mapping (torch.Tensor): A tensor mapping each input token
-            to the lora-id related to that token. A value of -1 indicates that
-            LoRA doesn't apply to that token.
-        token_indices_sorted_by_lora_ids (torch.Tensor): Row/Token indices from
-            the A matrix grouped by LoRA IDs.
-        num_tokens_per_lora (torch.Tensor): num_tokens_per_lora[i] is the number
-            of tokens that are to be processed by LoRA ID lora_ids[i]
-        lora_token_start_loc (torch.Tensor): A cumulative sum of
-            num_tokens_per_lora. lora_token_start_loc[0] is always 0 so that
-            lora_token_start_loc[i], along with num_tokens_per_lora[i]
-            identifies the region in token_indices_sorted_by_lora_ids that
-            LoRA lora_ids[i] should process.
-        lora_ids (torch.Tensor): LoRA ids to process.
-        no_lora_flag_cpu (torch.Tensor): A CPU tensor of size 1, that indicates
-            if there are any requests that require LoRA.
-        offset_start (int, optional): Offset start for output_tensor.
-            Defaults to 0.
-        add_inputs (bool, optional): Whether to add the input tensor to the
-            output tensor. Defaults to False.
-    """
+    """Args:
+    inputs (torch.Tensor): input tensor
+    lora_b_weights (list[torch.Tensor]): lora'b weight
+    output_tensor (torch.Tensor): output tensor
+    token_lora_mapping (torch.Tensor): A tensor mapping each input token
+        to the lora-id related to that token. A value of -1 indicates that
+        LoRA doesn't apply to that token.
+    token_indices_sorted_by_lora_ids (torch.Tensor): Row/Token indices from
+        the A matrix grouped by LoRA IDs.
+    num_tokens_per_lora (torch.Tensor): num_tokens_per_lora[i] is the number
+        of tokens that are to be processed by LoRA ID lora_ids[i]
+    lora_token_start_loc (torch.Tensor): A cumulative sum of
+        num_tokens_per_lora. lora_token_start_loc[0] is always 0 so that
+        lora_token_start_loc[i], along with num_tokens_per_lora[i]
+        identifies the region in token_indices_sorted_by_lora_ids that
+        LoRA lora_ids[i] should process.
+    lora_ids (torch.Tensor): LoRA ids to process.
+    no_lora_flag_cpu (torch.Tensor): A CPU tensor of size 1, that indicates
+        if there are any requests that require LoRA.
+    offset_start (int, optional): Offset start for output_tensor.
+        Defaults to 0.
+    add_inputs (bool, optional): Whether to add the input tensor to the
+        output tensor. Defaults to False.
 
+    """
     assert no_lora_flag_cpu.numel() == 1
     if no_lora_flag_cpu.item():
         # None of the inputs require LoRA.
@@ -201,12 +209,21 @@ def _lora_expand(
     NUM_SLICES = len(lora_b_weights)
 
     # Triton kernel configs.
-    BLOCK_M = 64
-    BLOCK_N = 128
-    BLOCK_K = 16
-    NUM_WARPS = 4
-    NUM_CTAS = 1
-    NUM_STAGES = 2
+    kernel_config = get_lora_op_configs(
+        op_type="expand",
+        max_loras=MAX_LORAS,
+        batch=M,
+        hidden_size=MAX_N,
+        rank=K,
+        num_slices=NUM_SLICES,
+        add_inputs=add_inputs,
+    )
+    BLOCK_M = kernel_config["block_m"]
+    BLOCK_N = kernel_config["block_n"]
+    BLOCK_K = kernel_config["block_k"]
+    NUM_WARPS = kernel_config["num_warps"]
+    NUM_CTAS = kernel_config["num_ctas"]
+    NUM_STAGES = kernel_config["num_stages"]
 
     EVEN_K = K % BLOCK_K == 0  # type: ignore
 
@@ -215,6 +232,10 @@ def _lora_expand(
         torch.bfloat16,
     ]:
         CAST_TYPE = True
+        # Pipelined wgmma with a register A operand is miscompiled by
+        # ptxas < 13.3 on SM90 (triton-lang/triton#9433).
+        if current_platform.is_cuda() and current_platform.is_device_capability(90):
+            NUM_STAGES = 1
 
     # TODO (varun): This grid formulation maximizes parallelization at the
     # cost of wasteful thread block launch when only a few input tokens require
@@ -222,12 +243,11 @@ def _lora_expand(
     grid = (
         triton.cdiv(M, BLOCK_M) * triton.cdiv(MAX_N, BLOCK_N),
         NUM_SLICES,
-        # Each LoRA receives its own set of thread blocks for output
-        # computation. If some LoRA doesn't have any tokens to process, its
-        # thread blocks simply exit.
-        MAX_LORAS,
+        num_active_loras.item(),
     )
 
+    # PDL only works when dual-stream is being used.
+    use_gdc = supports_pdl(inputs.device) and envs.VLLM_LORA_ENABLE_DUAL_STREAM
     _lora_expand_kernel[grid](
         inputs,
         lora_ptr_tensor,
@@ -257,27 +277,13 @@ def _lora_expand(
         CAST_TYPE,
         NUM_SLICES,
         same_stride,
+        use_gdc,
         num_warps=NUM_WARPS,
         num_ctas=NUM_CTAS,
         num_stages=NUM_STAGES,
+        launch_pdl=use_gdc,
     )
 
-    return
-
-
-def _lora_expand_fake(
-    inputs: torch.Tensor,
-    lora_b_weights: list[torch.Tensor],
-    output_tensor: torch.Tensor,
-    token_lora_mapping: torch.Tensor,
-    token_indices_sorted_by_lora_ids: torch.Tensor,
-    num_tokens_per_lora: torch.Tensor,
-    lora_token_start_loc: torch.Tensor,
-    lora_ids: torch.Tensor,
-    no_lora_flag_cpu: torch.Tensor,
-    offset_start: int = 0,
-    add_inputs: bool = False,
-) -> None:
     return
 
 
@@ -286,7 +292,6 @@ try:
         op_name="lora_expand",
         op_func=_lora_expand,
         mutates_args=["output_tensor"],
-        fake_impl=_lora_expand_fake,
     )
     lora_expand = torch.ops.vllm.lora_expand
 

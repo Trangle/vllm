@@ -4,9 +4,18 @@
     This is a historical document based on the [original paper for vLLM](https://arxiv.org/abs/2309.06180).
     It no longer describes the code used in vLLM today.
 
-Currently, vLLM utilizes its own implementation of a multi-head query
-attention kernel (`csrc/attention/attention_kernels.cu`).
-This kernel is designed to be compatible with
+At the time this document was written, vLLM used its own implementation
+of a multi-head query attention kernel (`csrc/attention/attention_kernels.cu`),
+described step by step below. That file no longer exists in the codebase.
+Paged attention is now implemented directly inside vLLM's attention
+backends (for example `TritonAttentionImpl` in
+`vllm/v1/attention/backends/triton_attn.py`, or the FlashAttention-based
+backend) using block tables built by the scheduler's KV-cache manager;
+`vllm/v1/attention/ops/paged_attn.py` only provides KV-cache layout
+helpers (`split_kv_cache`, `write_to_paged_cache`), not the attention
+computation itself.
+
+The kernel walked through below was designed to be compatible with
 vLLM's paged KV caches, where the key and value cache are stored in
 separate blocks (note that this block concept differs from the GPU
 thread block. So in a later document, I will refer to vLLM paged
@@ -36,7 +45,7 @@ the input pointers `q`, `k_cache`, and `v_cache`, which point
 to query, key, and value data on global memory that need to be read
 and processed. The output pointer `out` points to global memory
 where the result should be written. These four pointers actually
-refer to multi-dimensional arrays, but each thread only accesses the
+refer to multidimensional arrays, but each thread only accesses the
 portion of data assigned to it. I have omitted all other runtime
 parameters here for simplicity.
 
@@ -52,7 +61,7 @@ __device__ void paged_attention_kernel(
 )
 ```
 
-There are also a list of template arguments above the function
+There is also a list of template arguments above the function
 signature that are determined during compilation time. `scalar_t`
 represents the data type of the query, key, and value data elements,
 such as FP16. `HEAD_SIZE` indicates the number of elements in each
@@ -139,18 +148,14 @@ token data.
 const scalar_t* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
 ```
 
-<figure markdown="span">
-  ![](../assets/design/paged_attention/query.png){ align="center" alt="query" width="70%" }
-</figure>
+![query](../assets/design/paged_attention/query.png)
 
 Each thread defines its own `q_ptr` which points to the assigned
 query token data on global memory. For example, if `VEC_SIZE` is 4
 and `HEAD_SIZE` is 128, the `q_ptr` points to data that contains
 total of 128 elements divided into 128 / 4 = 32 vecs.
 
-<figure markdown="span">
-  ![](../assets/design/paged_attention/q_vecs.png){ align="center" alt="q_vecs" width="70%" }
-</figure>
+![q_vecs](../assets/design/paged_attention/q_vecs.png)
 
 ```cpp
 __shared__ Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
@@ -182,14 +187,12 @@ const scalar_t* k_ptr = k_cache + physical_block_number * kv_block_stride
                     + physical_block_offset * x;
 ```
 
-Unlike to `q_ptr`, `k_ptr` in each thread will point to different
+Unlike `q_ptr`, `k_ptr` in each thread will point to different
 key token at different iterations. As shown above, that `k_ptr`
 points to key token data based on `k_cache` at assigned block,
 assigned head and assigned token.
 
-<figure markdown="span">
-  ![](../assets/design/paged_attention/key.png){ align="center" alt="key" width="70%" }
-</figure>
+![key](../assets/design/paged_attention/key.png)
 
 The diagram above illustrates the memory layout for key data. It
 assumes that the `BLOCK_SIZE` is 16, `HEAD_SIZE` is 128, `x` is
@@ -202,9 +205,7 @@ iterations. Inside each rectangle, there are a total 32 vecs (128
 elements for one token) that will be processed by 2 threads (one
 thread group) separately.
 
-<figure markdown="span">
-  ![](../assets/design/paged_attention/k_vecs.png){ align="center" alt="k_vecs" width="70%" }
-</figure>
+![k_vecs](../assets/design/paged_attention/k_vecs.png)
 
 ```cpp
 K_vec k_vecs[NUM_VECS_PER_THREAD]
@@ -229,7 +230,7 @@ manner.
 
 ## QK
 
-As shown the pseudo code below, before the entire for loop block, we
+As shown the pseudocode below, before the entire for loop block, we
 fetch the query data for one token and store it in `q_vecs`. Then,
 in the outer for loop, we iterate through different `k_ptrs` that
 point to different tokens and prepare the `k_vecs` in the inner for
@@ -361,17 +362,11 @@ later steps. Now, it should store the normalized softmax result of
 
 ## Value
 
-<figure markdown="span">
-  ![](../assets/design/paged_attention/value.png){ align="center" alt="value" width="70%" }
-</figure>
+![value](../assets/design/paged_attention/value.png)
 
-<figure markdown="span">
-  ![](../assets/design/paged_attention/logits_vec.png){ align="center" alt="logits_vec" width="50%" }
-</figure>
+![logits_vec](../assets/design/paged_attention/logits_vec.png)
 
-<figure markdown="span">
-  ![](../assets/design/paged_attention/v_vec.png){ align="center" alt="v_vec" width="70%" }
-</figure>
+![v_vec](../assets/design/paged_attention/v_vec.png)
 
 Now we need to retrieve the value data and perform dot multiplication
 with `logits`. Unlike query and key, there is no thread group
@@ -403,7 +398,7 @@ for ... { // Iteration over different blocks.
 }
 ```
 
-As shown in the above pseudo code, in the outer loop, similar to
+As shown in the above pseudocode, in the outer loop, similar to
 `k_ptr`, `logits_vec` iterates over different blocks and reads
 `V_VEC_SIZE` elements from `logits`. In the inner loop, each
 thread reads `V_VEC_SIZE` elements from the same tokens as a
